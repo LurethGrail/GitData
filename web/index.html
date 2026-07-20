@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GITDATA // SIGINT TERMINAL</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="boot"><pre id="bootlog"></pre></div>
+
+<div id="app" hidden>
+
+  <header id="hud">
+    <div class="brand">
+      <span class="glyph">◈</span>
+      <span class="wordmark">GIT<b>DATA</b></span>
+      <span class="clsf">// OSINT · COLLABORATION GRAPH</span>
+    </div>
+    <div class="hudmetrics" id="hudmetrics"></div>
+    <div class="hudright">
+      <span class="pulse" id="simstate">IDLE</span>
+      <span class="clock" id="clock">--:--:--</span>
+    </div>
+  </header>
+
+  <aside id="rack">
+    <div class="rackhead">
+      <span>FILTER RACK</span>
+      <button id="reset" class="mini">RESET</button>
+    </div>
+    <div class="rackbody">
+
+      <section class="fgroup">
+        <h4>QUERY</h4>
+        <input id="q" class="txt" placeholder="repo / owner / person…" autocomplete="off">
+        <div class="hint">Substring über full_name · leer = alles</div>
+      </section>
+
+      <section class="fgroup">
+        <h4>LINK-TOPOLOGIE</h4>
+        <label class="rng"><span>MIN SHARED CONTRIB</span><b id="v_shared">1</b>
+          <input type="range" id="f_shared" min="1" max="12" value="1"></label>
+        <label class="rng"><span>MIN COMMITS / LINK</span><b id="v_weight">1</b>
+          <input type="range" id="f_weight" min="1" max="100" value="1"></label>
+        <label class="rng"><span>PERSON: MIN REPOS</span><b id="v_degree">1</b>
+          <input type="range" id="f_degree" min="1" max="20" value="1"></label>
+        <label class="chk"><input type="checkbox" id="f_isolates" checked> ISOLIERTE AUSBLENDEN</label>
+        <label class="chk"><input type="checkbox" id="f_nobots" checked> BOTS AUSSCHLIESSEN</label>
+      </section>
+
+      <section class="fgroup">
+        <h4>SPRACHE <i id="c_lang"></i></h4>
+        <div class="chips" id="f_langs"></div>
+      </section>
+
+      <section class="fgroup">
+        <h4>METRIK-SCHWELLEN</h4>
+        <label class="rng"><span>STARS ≥</span><b id="v_stars">0</b>
+          <input type="range" id="f_stars" min="0" max="100" value="0"></label>
+        <label class="rng"><span>FORKS ≥</span><b id="v_forks">0</b>
+          <input type="range" id="f_forks" min="0" max="100" value="0"></label>
+        <label class="rng"><span>OPEN ISSUES ≥</span><b id="v_issues">0</b>
+          <input type="range" id="f_issues" min="0" max="100" value="0"></label>
+        <label class="rng"><span>CONTRIBUTORS ≥</span><b id="v_contrib">0</b>
+          <input type="range" id="f_contrib" min="0" max="60" value="0"></label>
+      </section>
+
+      <section class="fgroup">
+        <h4>ZEITFENSTER <i>letzter Push</i></h4>
+        <label class="rng"><span>AB JAHR</span><b id="v_push">—</b>
+          <input type="range" id="f_push" min="0" max="1" value="0"></label>
+        <label class="rng"><span>BIS JAHR</span><b id="v_pushmax">—</b>
+          <input type="range" id="f_pushmax" min="0" max="1" value="1"></label>
+        <label class="rng"><span>GRÖSSE ≥ KB</span><b id="v_size">0</b>
+          <input type="range" id="f_size" min="0" max="100" value="0"></label>
+      </section>
+
+      <section class="fgroup">
+        <h4>ATTRIBUTE</h4>
+        <div class="segbar" id="f_ownertype"></div>
+        <label class="chk"><input type="checkbox" id="f_noarch"> ARCHIVIERTE AUSBLENDEN</label>
+        <label class="chk"><input type="checkbox" id="f_nofork"> FORKS AUSBLENDEN</label>
+        <label class="chk"><input type="checkbox" id="f_rel"> NUR MIT RELEASES</label>
+        <label class="chk"><input type="checkbox" id="f_dep"> NUR MIT DEPENDENCIES</label>
+      </section>
+
+      <section class="fgroup">
+        <h4>LIZENZ</h4>
+        <select id="f_license" class="sel"></select>
+      </section>
+
+      <section class="fgroup">
+        <h4>TOPIC</h4>
+        <select id="f_topic" class="sel"></select>
+      </section>
+
+      <section class="fgroup">
+        <h4>CLUSTER</h4>
+        <select id="f_cluster" class="sel"></select>
+        <div class="hint">Label-Propagation über die Co-Contribution-Kanten</div>
+      </section>
+
+      <section class="fgroup">
+        <h4>TRACE // VERBINDUNG</h4>
+        <div class="tracerow"><i>A</i><span id="tr_a">— nicht gesetzt —</span></div>
+        <div class="tracerow"><i>B</i><span id="tr_b">— nicht gesetzt —</span></div>
+        <button id="tr_run" class="mini wide">PFAD BERECHNEN</button>
+        <div class="hint" id="tr_out">Knoten wählen → SET A / SET B im Inspektor</div>
+      </section>
+
+    </div>
+  </aside>
+
+  <main id="stage">
+    <nav id="modes">
+      <button class="mode on" data-mode="network">NETZWERK</button>
+      <button class="mode" data-mode="matrix">MATRIX</button>
+      <button class="mode" data-mode="scatter">STREUUNG</button>
+      <button class="mode" data-mode="orbit">ORBIT</button>
+      <span class="spacer"></span>
+      <span class="colorlbl">FARBE</span>
+      <select id="colorby" class="sel tight">
+        <option value="lang">Sprache</option>
+        <option value="cluster">Cluster</option>
+        <option value="stars">Stars</option>
+        <option value="age">Aktivität</option>
+        <option value="type">Owner-Typ</option>
+        <option value="degree">Zentralität</option>
+      </select>
+      <button id="labels" class="mode tight on">LABELS</button>
+      <button id="refit" class="mode tight">FIT</button>
+    </nav>
+    <div class="canvaswrap">
+      <canvas id="view"></canvas>
+      <div class="corner tl"></div><div class="corner tr"></div>
+      <div class="corner bl"></div><div class="corner br"></div>
+      <div id="readout"></div>
+      <div id="legend"></div>
+      <div id="tooltip"></div>
+    </div>
+  </main>
+
+  <aside id="intel">
+    <div class="rackhead"><span id="intelhead">INSPEKTOR</span></div>
+    <div class="rackbody">
+      <div id="inspector" class="empty">Kein Objekt selektiert.<br><br>
+        <span class="dim">Klick auf einen Knoten — oder ein Ziel aus den Ranglisten.</span></div>
+      <section class="fgroup">
+        <h4>TOP CONNECTORS <i>Personen über Projekte</i></h4>
+        <div id="topconn" class="list"></div>
+      </section>
+      <section class="fgroup">
+        <h4>STÄRKSTE LINKS <i>gemeinsame Contributors</i></h4>
+        <div id="topedges" class="list"></div>
+      </section>
+      <section class="fgroup">
+        <h4>HUBS <i>nach Grad im Netz</i></h4>
+        <div id="tophubs" class="list"></div>
+      </section>
+    </div>
+  </aside>
+
+  <footer id="dash">
+    <div class="panel"><h5>LAGE</h5><div id="tiles"></div></div>
+    <div class="panel"><h5>NETZ-TOPOLOGIE</h5><div id="netstats"></div></div>
+    <div class="panel"><h5>SPRACHEN <i>Bytes</i></h5><div id="langbars" class="scrolly"></div></div>
+    <div class="panel"><h5>AKTIVITÄT <i>Push/Jahr</i></h5><canvas id="hist"></canvas></div>
+    <div class="panel"><h5>STARS <i>log₁₀</i></h5><canvas id="dist"></canvas></div>
+  </footer>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

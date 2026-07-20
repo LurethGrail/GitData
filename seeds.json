@@ -1,0 +1,15 @@
+{
+  "_comment": "Acceptance-Dataset des MVP: das PyData-Oekosystem. Gewaehlt wegen echter, dichter Contributor-Overlaps -> aussagekraeftiger Beziehungsgraph. Austauschbar: 'orgs'/'users' lassen Repos automatisch listen.",
+  "repos": [
+    "numpy/numpy",
+    "scipy/scipy",
+    "pandas-dev/pandas",
+    "matplotlib/matplotlib",
+    "scikit-learn/scikit-learn",
+    "pydata/xarray",
+    "scikit-image/scikit-image",
+    "statsmodels/statsmodels"
+  ],
+  "orgs": [],
+  "users": []
+}

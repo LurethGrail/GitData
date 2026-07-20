@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd-Supervisor fuer den GitData-Mass-Crawler.
+  Laeuft dauerhaft, startet nach Absturz UND nach Reboot automatisch neu
+  (KeepAlive + RunAtLoad) => "unterbrechungssicher ueber sehr lange Zeit".
+
+  Der/die Token liegen in data/token (eine Zeile pro Token, gitignored) und
+  werden vom Crawler von dort gelesen — bewusst NICHT hier im Plist, damit kein
+  Secret in ~/Library/LaunchAgents steht.
+
+  Installation:
+    1. cp deploy/com.gitdata.crawler.plist ~/Library/LaunchAgents/
+    2. launchctl load ~/Library/LaunchAgents/com.gitdata.crawler.plist
+  Stoppen:
+    launchctl unload ~/Library/LaunchAgents/com.gitdata.crawler.plist
+  Logs:
+    tail -f "/Users/lureth/Developer/GitData/data/crawler.log"
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gitdata.crawler</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.13/bin/python3</string>
+        <string>-u</string>                <!-- ungepuffert: Log erscheint sofort -->
+        <string>-m</string>
+        <string>gitdata</string>
+        <string>run</string>
+        <string>--split-enum</string>
+        <string>10</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lureth/Developer/GitData</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Nur nach Absturz neu starten, NICHT nach sauberem Exit 0 (Ziel erreicht).
+         So laeuft der Crawler ueber Reboots/Abstuerze weiter, stoppt aber
+         endgueltig, sobald ganz GitHub verarbeitet ist. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Nicht schneller als alle 30s neustarten (kein Crash-Loop). -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lureth/Developer/GitData/data/crawler.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lureth/Developer/GitData/data/crawler.log</string>
+</dict>
+</plist>
