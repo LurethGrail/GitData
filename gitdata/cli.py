@@ -40,6 +40,10 @@ def main(argv=None) -> int:
     dt = sub.add_parser("detail", help="Offene Repos anreichern (volle Metadaten)")
     dt.add_argument("--limit", type=int, default=50)
 
+    en = sub.add_parser("enrich", help="Kern-Owner-Profile holen + verorten (Weltansicht)")
+    en.add_argument("--limit", type=int, default=None,
+                    help="Nur so viele Owner anreichern (Test); Default: alle offenen")
+
     r = sub.add_parser("run", help="Autonomer Daemon: enumeriert ganz GitHub, dann Detail, stoppt am Ziel")
     r.add_argument("--split-enum", type=int, default=None,
                    help="Tokens dediziert fuer Enumeration (Rest fuer Detail, beide parallel). "
@@ -87,6 +91,8 @@ def main(argv=None) -> int:
         except crawl.RateLimitExhausted as e:
             print(f"Gestoppt: {e}")
         crawl.status(conn)
+    elif args.cmd == "enrich":
+        crawl.enrich(db_path=args.db, token=token, limit=args.limit)
     elif args.cmd == "run":
         token_split = args.split_enum
         if token_split is None and token:
@@ -100,7 +106,7 @@ def main(argv=None) -> int:
         conn = db.connect(args.db); db.init_schema(conn)
         crawl.status(conn)
     elif args.cmd == "serve":
-        serve.serve(db_path=args.db, host=args.host, port=args.port)
+        serve.serve(db_path=args.db, host=args.host, port=args.port, tokens=token)
     elif args.cmd == "selfcheck":
         from tests import test_gitdata
         test_gitdata.run()

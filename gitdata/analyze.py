@@ -5,6 +5,8 @@ Crawler anzufassen — neue Kennzahl = neue Query.
 """
 from __future__ import annotations
 
+from . import geo as _geo
+
 BOT = "AND owner_login NOT LIKE '%[bot]'"
 
 
@@ -113,10 +115,22 @@ def intel(conn) -> dict:
     def rows(sql):
         return [dict(r) for r in conn.execute(sql).fetchall() if r[0] in ids]
 
+    # Geo je Owner-Login (aus enrich/geo abgeleitet). Der Client haengt es sowohl
+    # an Repos (ueber owner_login = Herkunft des Repos) als auch an Personen.
+    # Nur verortete Owner — das ist ~die Kern-Menge, ein Full-Scan reicht.
+    geo = [dict(r) for r in conn.execute(
+        "SELECT login, country, city, lat, lon FROM owners WHERE lat IS NOT NULL").fetchall()]
+    # ISO2 mitgeben: der Globus matcht die Laender-Polygone (Natural Earth) ueber
+    # den Code, nicht ueber den Namen — "United States of America" vs
+    # "United States" wuerde sonst je Datensatz einzeln verglichen werden muessen.
+    for g in geo:
+        g["iso"] = _geo.COUNTRIES.get(g["country"], (0, 0, None))[2]
+
     return {
         "repos": repos,
         "people": people,
         "links": links,
+        "geo": geo,
         "langs": rows("SELECT repo_id, language, bytes FROM repo_languages"),
         "topics": rows("SELECT repo_id, topic FROM repo_topics"),
         "releases": rows("SELECT repo_id, tag, author_login, published_at FROM releases"),

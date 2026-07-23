@@ -10,8 +10,74 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from gitdata import analyze, crawl, db
+from gitdata import analyze, crawl, db, geo
 from gitdata.github import parse_link_next
+
+
+def test_geocode():
+    geo.demo()  # deckt Laender/Staedte/Aliasse/US-Staaten + Koordinaten-Grenzen ab
+    assert geo.geocode("nowhere-ville") is None
+    # Stadt schlaegt Land bei der Koordinate
+    c = geo.geocode("Berlin, Germany")
+    assert c[0] == "Germany" and abs(c[2] - 52.52) < .1, c
+
+
+def test_transient_retry():
+    """Verbindungsabbrueche werden zurueckversucht statt den Aufrufer abzuwerfen.
+    Das war die Ursache des tagelangen Crawler-Stillstands."""
+    import http.client
+    import urllib.request
+    from gitdata import github as gh
+
+    conn = db.connect(":memory:"); db.init_schema(conn)
+    c = gh.GitHubClient(conn, token="t")
+
+    class _Resp:                       # minimaler urlopen-Ersatz
+        status = 200
+        headers = {"ETag": None, "Last-Modified": None, "Link": None,
+                   "X-RateLimit-Remaining": "42", "X-RateLimit-Reset": "0"}
+        def read(self): return b'{"ok":true}'
+        def close(self): pass
+
+    calls = []
+    def flaky(req, **kw):
+        calls.append(1)
+        if len(calls) < 3:             # zweimal abbrechen, dann liefern
+            raise http.client.IncompleteRead(b"partial")
+        return _Resp()
+    orig, gh.time.sleep = urllib.request.urlopen, lambda s: None
+    urllib.request.urlopen = flaky
+    try:
+        assert c.get("https://api.github.com/x") == {"ok": True}, "Retry lieferte nichts"
+        assert len(calls) == 3, calls
+        # Ueber das Limit hinaus -> Fehler propagiert (Worker macht Backoff)
+        calls.clear()
+        urllib.request.urlopen = lambda req, **kw: (calls.append(1),
+            (_ for _ in ()).throw(ConnectionResetError("boom")))[0]
+        try:
+            c.get("https://api.github.com/y")
+            assert False, "haette ConnectionResetError werfen muessen"
+        except ConnectionResetError:
+            pass
+        assert len(calls) == gh.NET_ATTEMPTS, calls
+    finally:
+        urllib.request.urlopen = orig
+
+
+def test_enrich_geocode():
+    """geocode_owner/geocode_pending schreiben Geo aus owners.location."""
+    conn = db.connect(":memory:")
+    db.init_schema(conn)
+    crawl.upsert_owner(conn, {"id": 1, "login": "a", "location": "Tokyo, Japan"})
+    crawl.upsert_owner(conn, {"id": 2, "login": "b", "location": "Mars Base Alpha"})
+    conn.commit()
+    assert crawl.geocode_pending(conn) == 1          # nur "a" verortbar
+    row = conn.execute("SELECT country, city, lat FROM owners WHERE login='a'").fetchone()
+    assert row["country"] == "Japan" and row["city"] == "Tokyo", tuple(row)
+    # "b" ist als versucht markiert -> keine Dauerschleife bei erneutem Lauf
+    assert crawl.geocode_pending(conn) == 0
+    # verortete Owner landen im intel-Payload
+    assert any(g["login"] == "a" for g in analyze.intel(conn)["geo"])
 
 
 def test_link_parser():
@@ -155,6 +221,9 @@ def test_chunks():
 
 def run():
     test_link_parser()
+    test_geocode()
+    test_transient_retry()
+    test_enrich_geocode()
     test_overlap_and_cross_project()
     test_intel_payload()
     test_frontier()

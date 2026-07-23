@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import json
 import signal
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import db
+from . import db, geo
 from .github import GitHubClient, RateLimitExhausted
 
 SEEDS_FILE = Path(__file__).resolve().parent.parent / "seeds.json"
@@ -199,6 +200,107 @@ def list_owner_repos(client: GitHubClient, login: str, max_pages: int = 2) -> li
         if isinstance(r, dict) and not r.get("fork"):
             repos.append(r["full_name"])
     return repos
+
+
+# ---------------------------------------------------------------------------
+# Owner-Anreicherung + Geo. Der Massen-Crawl holt nur eingebettete Owner-Basics
+# (id/login/type) — Location steckt erst im vollen /users/{login}-Profil. `enrich`
+# holt die Profile der Kern-Owner (detaillierte Repos + deren Contributors) und
+# leitet Land/Stadt offline aus geo.py ab. Das speist die Weltansicht.
+# ---------------------------------------------------------------------------
+def _enrich_worklist(conn) -> list[str]:
+    """Kern-Owner-Logins ohne volles Profil, Repo-Owner zuerst (jedes detaillierte
+    Repo bekommt so ein Land), dann Contributors. Bots raus."""
+    rows = conn.execute(
+        """SELECT login, MIN(rank) AS r FROM (
+               SELECT owner_login AS login, 0 AS rank FROM repos WHERE detailed=1
+               UNION ALL
+               SELECT owner_login AS login, 1 AS rank FROM contributions
+           )
+           WHERE login NOT LIKE '%[bot]'
+             AND login IN (SELECT login FROM owners WHERE enriched=0)
+           GROUP BY login ORDER BY r""").fetchall()
+    return [r[0] for r in rows]
+
+
+def geocode_owner(conn, login: str, location: str | None) -> bool:
+    hit = geo.geocode(location)
+    if hit:
+        country, city, lat, lon = hit
+        conn.execute(
+            "UPDATE owners SET country=?, city=?, lat=?, lon=?, geo_tried=1 WHERE login=?",
+            (country, city, lat, lon, login))
+        return True
+    conn.execute("UPDATE owners SET geo_tried=1 WHERE login=?", (login,))
+    return False
+
+
+def geocode_pending(conn) -> int:
+    """Offline-Nachlese: owners mit Location aber noch ohne Geo verorten. Frei —
+    nach jedem geo.py-Update erneut sinnvoll (geo_tried dann zuruecksetzen)."""
+    rows = conn.execute(
+        "SELECT login, location FROM owners "
+        "WHERE geo_tried=0 AND location IS NOT NULL AND location!=''").fetchall()
+    n = sum(geocode_owner(conn, login, loc) for login, loc in rows)
+    conn.commit()
+    return n
+
+
+def enrich(db_path=db.DEFAULT_DB, token: str | None = None,
+           limit: int | None = None, log: bool = True) -> tuple[int, int]:
+    """Kern-Owner-Profile holen (Location) und verorten. Idempotent, resumebar:
+    404 und Treffer werden markiert, ein zweiter Lauf ueberspringt sie."""
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    client = GitHubClient(conn, token=token)
+    logins = _enrich_worklist(conn)
+    if limit:
+        logins = logins[:limit]
+    total = len(logins)
+    if log:
+        print(f"enrich: {total} Kern-Owner ohne Profil "
+              f"({client.token_count} Token).")
+    fetched = located = skipped = 0
+    try:
+        for login in logins:
+            try:
+                u = client.get_json(f"/users/{login}")
+            except RateLimitExhausted:
+                raise                      # sauber stoppen, Fortschritt bleibt
+            except Exception as e:
+                # Transient (RemoteDisconnected/Timeout/SSL): einmal kurz warten,
+                # dann ueberspringen — der naechste Lauf holt den Login nach.
+                skipped += 1
+                time.sleep(2)
+                try:
+                    u = client.get_json(f"/users/{login}")
+                except RateLimitExhausted:
+                    raise
+                except Exception:
+                    if log and skipped % 25 == 1:
+                        print(f"  ! Netzfehler bei @{login}: {type(e).__name__} — übersprungen")
+                    continue
+            if not u:  # 404/gesperrt -> nicht erneut versuchen
+                conn.execute(
+                    "UPDATE owners SET enriched=1, geo_tried=1 WHERE login=?", (login,))
+                conn.commit()
+                continue
+            upsert_owner(conn, u, enriched=1)
+            if geocode_owner(conn, login, u.get("location")):
+                located += 1
+            conn.commit()
+            fetched += 1
+            if log and fetched % 100 == 0:
+                print(f"  … {fetched}/{total} Profile · {located} verortet · "
+                      f"Rate-Rest {client.total_remaining}")
+    except RateLimitExhausted as e:
+        print(f"  Rate-Limit erreicht, Fortschritt gespeichert: {e}")
+    located += geocode_pending(conn)  # evtl. schon vorher enrichte Owner mitnehmen
+    if log:
+        tail = f", {skipped} übersprungen (nächster Lauf holt sie)" if skipped else ""
+        print(f"enrich fertig: {fetched} Profile geholt, {located} verortet{tail}.")
+    conn.close()
+    return fetched, located
 
 
 def crawl(db_path=db.DEFAULT_DB, seeds_path=SEEDS_FILE, token: str | None = None,
@@ -455,9 +557,18 @@ def _detail_one(client: GitHubClient, conn, rid: int, full: str) -> None:
         conn.commit()
         raise
     except Exception as e:  # transient -> Versuch zaehlen, Repo wieder freigeben
-        conn.execute("UPDATE repos SET detailed=0, attempts=attempts+1 WHERE id=?", (rid,))
-        conn.commit()
-        print(f"  ! {full}: {type(e).__name__}: {e}")
+        # Eine belegte DB ist nicht die Schuld des Repos: wuerde sie als Fehlversuch
+        # zaehlen, waeren nach 5 Sperrkonflikten kerngesunde Repos als Poison-Pill
+        # aussortiert. Nur echte Hol-Fehler erhoehen attempts.
+        locked = isinstance(e, sqlite3.OperationalError) and "locked" in str(e).lower()
+        bump = "" if locked else ", attempts=attempts+1"
+        try:
+            conn.execute(f"UPDATE repos SET detailed=0{bump} WHERE id=?", (rid,))
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass          # Claim faellt beim naechsten Start ueber Crash-Recovery zurueck
+        if not locked:
+            print(f"  ! {full}: {type(e).__name__}: {e}")
 
 
 def _worker(idx: int, token, db_path, stop_ev: threading.Event, prog: _Progress,
@@ -485,9 +596,11 @@ def _worker(idx: int, token, db_path, stop_ev: threading.Event, prog: _Progress,
                           f"offene Chunks: {enum_open(conn):,} | T{idx}")
                 continue
 
-            if skip_enum and enum_open(conn) > 0:
-                _sleep_until(int(time.time()) + 2, stop_ev.is_set)  # warte auf Enum-Partner
-                continue
+            # Frueher warteten Detail-Worker hier, solange ueberhaupt Chunks offen
+            # waren. Bei 2.000 offenen Chunks hiess das: die halbe Flotte hat
+            # tagelang geschlafen, obwohl 1,4 Mio Repos in der Queue lagen — und
+            # sobald die Enumeration klemmte, stand der ganze Crawl. Jetzt faellt
+            # der Worker direkt in Phase 2 und schlaeft nur, wenn die Queue leer ist.
 
             # Phase 2: Detail-Queue abarbeiten.
             claimed = _claim_one(conn)
@@ -512,11 +625,23 @@ def _worker(idx: int, token, db_path, stop_ev: threading.Event, prog: _Progress,
         except RateLimitExhausted as e:
             if active_chunk is not None:         # Walk unterbrochen -> Chunk freigeben
                 _set_chunk(conn, active_chunk, 0)
+            # Ohne diese Zeile verstummt der Daemon beim Warten komplett und sieht
+            # von aussen aus wie abgestuerzt. Wartezeiten gehoeren ins Log.
+            wait = max(0, e.reset_epoch - int(time.time()))
+            print(f"[{_now()}] T{idx}: Rate-Limit leer — warte {wait//60}m{wait%60:02d}s "
+                  f"bis {datetime.fromtimestamp(e.reset_epoch).strftime('%H:%M:%S')}.")
             _sleep_until(e.reset_epoch, stop_ev.is_set)
             client.clear_rate_limit()
         except Exception as e:  # Netzwerkausfall o.ae. -> Backoff statt Absturz
             if active_chunk is not None:
                 _set_chunk(conn, active_chunk, 0)
+            # Sperrkonflikte sind hausgemacht (20 Writer, ein SQLite-Writer) und
+            # nach Millisekunden weg — dafuer 30 s zu pausieren verschenkt den
+            # halben Durchsatz. Netzfehler brauchen die lange Pause weiterhin.
+            locked = isinstance(e, sqlite3.OperationalError) and "locked" in str(e).lower()
+            if locked:
+                _sleep_until(int(time.time()) + 1, stop_ev.is_set)
+                continue
             print(f"[{_now()}] T{idx} Fehler: {type(e).__name__}: {e} — 30s Backoff.")
             _sleep_until(int(time.time()) + 30, stop_ev.is_set)
     conn.close()
@@ -542,8 +667,20 @@ def run(db_path=db.DEFAULT_DB, token=None, max_details: int | None = None,
     values = [s.value for s in GitHubClient(conn, token=token).slots]
     conn.close()
 
+    # Echtes Budget messen statt Tokens hochzurechnen: GitHub limitiert pro
+    # ACCOUNT. Liegen alle Tokens auf einem Account, sind 20 Tokens weiterhin
+    # 5.000/h — die alte Anzeige "~100000/h" war schlicht falsch.
     nt = sum(1 for v in values if v)
-    budget = f"{nt} Token(s), ~{nt * 5000}/h" if nt else "kein Token, 60/h"
+    if nt:
+        from . import ops as _ops
+        b = _ops.real_budget([v for v in values if v])
+        if b["limit"]:
+            budget = (f"{nt} Token(s), real {b['remaining']:,}/{b['limit']:,} frei"
+                      + (" — AUFGEBRAUCHT, warte auf Reset" if b["exhausted"] else ""))
+        else:
+            budget = f"{nt} Token(s), Budget nicht messbar ({b.get('err')})"
+    else:
+        budget = "kein Token, 60/h"
     ziel = "nur Enumeration" if enumerate_only else "Enumeration -> Detail -> Stopp"
 
     # Split-Tokens: erste N dediziert Enum, Rest dediziert Detail, beide parallel

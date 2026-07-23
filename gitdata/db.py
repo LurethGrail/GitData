@@ -138,16 +138,30 @@ _MIGRATIONS = [
     ("repos", "discovered_at", "TEXT"),
     ("repos", "parent_id", "INTEGER"),
     ("repos", "source_id", "INTEGER"),
+    # Geo aus owners.location abgeleitet (gitdata geo/enrich). country/city sind
+    # kanonisch (aus geo.py), lat/lon der Zentroid- bzw. Stadt-Koordinate.
+    ("owners", "country", "TEXT"),
+    ("owners", "city", "TEXT"),
+    ("owners", "lat", "REAL"),
+    ("owners", "lon", "REAL"),
+    ("owners", "geo_tried", "INTEGER DEFAULT 0"),  # 1 = location einmal geparst (auch wenn leer)
 ]
 
 
 def connect(db_path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30)
+    conn = sqlite3.connect(db_path, timeout=60)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")       # gleichzeitige Reader + 1 Writer
-    conn.execute("PRAGMA busy_timeout=30000")     # Writer warten statt "database is locked"
+    # SQLite kennt nur EINEN Writer. Der Daemon faehrt 20 Worker-Threads, die alle
+    # schreiben — bei 30 s Wartezeit kam es unter Last zu "database is locked",
+    # und jeder Treffer kostete den Worker 30 s Backoff.
+    conn.execute("PRAGMA busy_timeout=60000")
+    # In WAL ist synchronous=NORMAL crash-sicher (nur bei Stromausfall koennen die
+    # letzten Transaktionen fehlen) und kuerzt die Schreibsperre deutlich —
+    # weniger Sperrzeit heisst weniger Kollisionen zwischen den Workern.
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 

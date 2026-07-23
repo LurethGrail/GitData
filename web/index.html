@@ -18,12 +18,19 @@
       <span class="clsf">// OSINT · COLLABORATION GRAPH</span>
     </div>
     <div class="hudmetrics" id="hudmetrics"></div>
+    <nav id="sectionnav">
+      <button class="navbtn on" data-goto="terminal">◈ GRAPH</button>
+      <button class="navbtn" data-goto="patterns">⧉ PATTERNS</button>
+      <button class="navbtn" data-goto="world">✧ WORLD</button>
+      <button class="navbtn" data-goto="ops">⚙ OPS</button>
+    </nav>
     <div class="hudright">
       <span class="pulse" id="simstate">IDLE</span>
       <span class="clock" id="clock">--:--:--</span>
     </div>
   </header>
 
+  <div id="terminal">
   <aside id="rack">
     <div class="rackhead">
       <span>FILTER RACK</span>
@@ -168,6 +175,107 @@
     <div class="panel"><h5>AKTIVITÄT <i>Push/Jahr</i></h5><canvas id="hist"></canvas></div>
     <div class="panel"><h5>STARS <i>log₁₀</i></h5><canvas id="dist"></canvas></div>
   </footer>
+  </div><!-- /#terminal -->
+
+  <div class="splitter"><span>⧉ RELATION PATTERNS</span><i>Vorlagen auf den aktuell gefilterten Datenberg anwenden — Verhaltensmuster &amp; logische Schlüsse</i></div>
+
+  <section id="patterns">
+    <!-- Steckbrief: natürlichsprachiges Profil der aktuellen Auswahl -->
+    <div id="steckbrief" class="sb empty">
+      <div class="sb-hint">Nichts ausgewählt — klick einen Knoten im Graphen, eine Person in den Ranglisten oder einen Beleg unten. Hier erscheint dann ein Steckbrief in ganzen Sätzen.</div>
+    </div>
+
+    <div class="pat-bar">
+      <span class="pat-bar-t">MUSTER-BIBLIOTHEK</span>
+      <b id="pat-scope">—</b>
+      <span class="spacer"></span>
+      <button id="pat-clear" class="mini" hidden>ERGEBNIS SCHLIESSEN ×</button>
+    </div>
+    <div id="pat-cards" class="pat-grid"></div>
+    <div class="pat-result" id="pat-result" hidden></div>
+  </section>
+
+  <div class="splitter"><span>✧ WORLD VIEW</span><i>Herkunft der Repos &amp; Akteure — abgeleitet aus dem <code>location</code>-Feld der Profile</i></div>
+
+  <section id="world">
+    <div class="world-wrap">
+      <div class="world-main">
+        <div class="world-bar">
+          <div class="world-modes">
+            <button class="wmode on" data-wproj="globe">◍ GLOBUS</button>
+            <button class="wmode" data-wproj="flat">▭ KARTE</button>
+          </div>
+          <div class="world-modes">
+            <button class="wmode on" data-wmode="repos">REPOS</button>
+            <button class="wmode" data-wmode="people">AKTEURE</button>
+          </div>
+          <div class="world-modes">
+            <button class="wmode on" id="w_spin" title="Automatisch drehen">↻ SPIN</button>
+            <button class="wmode" id="w_reset" title="Ansicht zurücksetzen">⌂ RESET</button>
+          </div>
+          <span class="spacer"></span>
+          <span id="world-readout" class="dim"></span>
+        </div>
+        <div class="worldwrap-canvas">
+          <canvas id="worldmap"></canvas>
+          <div id="worldtip"></div>
+        </div>
+      </div>
+      <aside class="world-side">
+        <section class="fgroup">
+          <h4>GEO-ABDECKUNG</h4>
+          <div id="world-cov" class="cov"></div>
+        </section>
+        <section class="fgroup">
+          <h4>LÄNDER <i>nach Anzahl</i></h4>
+          <div id="world-countries" class="list scrolly" style="max-height:240px"></div>
+        </section>
+        <section class="fgroup">
+          <h4>STÄDTE <i>Ballungen</i></h4>
+          <div id="world-cities" class="list scrolly" style="max-height:200px"></div>
+        </section>
+        <section class="fgroup">
+          <h4 id="world-drill-h">VON HIER <i>Ort wählen</i></h4>
+          <div id="world-drill" class="list scrolly" style="max-height:300px"></div>
+        </section>
+      </aside>
+    </div>
+  </section>
+
+  <div class="splitter"><span>⚙ OPS · AGENTS &amp; DURCHSATZ</span><i>Was die Crawler gerade tun, wie viel Token-Budget übrig ist und wann es fertig wird</i></div>
+
+  <section id="ops">
+    <div class="ops-wrap">
+      <div class="ops-panel">
+        <h4>AGENTS <i id="ops-agentcount"></i></h4>
+        <div id="ops-agents" class="ops-agents"></div>
+        <div id="ops-controls" class="ops-controls"></div>
+        <div class="hint" id="ops-stamp">—</div>
+      </div>
+
+      <div class="ops-panel">
+        <h4>ARBEIT <i>Fortschritt &amp; Restzeit</i></h4>
+        <div id="ops-work"></div>
+      </div>
+
+      <div class="ops-panel">
+        <h4>TOKEN-BUDGET <i id="ops-tokhead"></i></h4>
+        <div id="ops-budget"></div>
+        <div id="ops-tokens" class="tokgrid"></div>
+      </div>
+    </div>
+
+    <div class="ops-log">
+      <div class="ops-log-head">
+        <span>AGENT-LOG</span>
+        <select id="ops-logsel" class="sel tight"></select>
+        <label class="chk" style="margin:0"><input type="checkbox" id="ops-logfollow" checked> MITLAUFEN</label>
+        <span class="spacer"></span>
+        <span id="ops-logstate" class="dim"></span>
+      </div>
+      <pre id="ops-logtext">—</pre>
+    </div>
+  </section>
 
 </div>
 <script src="app.js"></script>

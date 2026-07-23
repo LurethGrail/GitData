@@ -38,6 +38,8 @@ const CY = CSSV("--cyan") || "#28f5d8", AM = CSSV("--amber") || "#ffc061",
 const FONT = (px) => `${px}px ui-monospace, Menlo, monospace`;
 const F_NODE = FONT(12), F_AXIS = FONT(11), F_MATRIX = FONT(10), F_MINI = FONT(10);
 
+// Obergrenze gezeichneter Kanten je Frame (die schwaechsten fallen zuerst weg).
+const EDGE_BUDGET = 15000;
 const langColor = (l) => LANG_COLORS[l] || "#93a7b0";
 const ramp = (t) => { // cyan -> amber -> magenta
   t = clamp(t, 0, 1);
@@ -153,9 +155,19 @@ function ingest(d) {
     S.maxIssues = Math.max(S.maxIssues, r.open_issues);
     S.maxSize = Math.max(S.maxSize, r.size);
   }
+  S.geoByLogin = new Map();
+  S.isoByCountry = new Map();       // Land -> ISO2, Bruecke zu den Globus-Polygonen
+  for (const g of d.geo || []) {
+    S.geoByLogin.set(g.login, g);
+    if (g.iso) S.isoByCountry.set(g.country, g.iso);
+  }
+
   S.years = [...new Set(S.repos.map((r) => r.pyear).filter(Boolean))].sort();
   F.pushFrom = S.years[0]; F.pushTo = S.years[S.years.length - 1];
 }
+// Geo eines Repos = Standort seines Owners (Herkunft des Repos).
+const repoGeo = (r) => S.geoByLogin.get(r.owner_login);
+const personGeo = (login) => S.geoByLogin.get(login);
 
 /* ===================== FILTER → NODES ===================== */
 function activePeople() {
@@ -232,6 +244,13 @@ function rebuild() {
 
   const alive = new Set(nodes.map((n) => n.id));
   S.edges = S.edges.filter((e) => alive.has(e.src) && alive.has(e.dst));
+  S.maxShared = Math.max(1, ...S.edges.map((e) => e.shared));
+  // Knotenreferenzen einmal aufloesen (spart 2 Map-Lookups je Kante und Frame)
+  // und nach Gewicht sortiert auf ein Zeichenbudget kuerzen.
+  for (const e of S.edges) { e.a = S.repoById.get(e.src); e.b = S.repoById.get(e.dst); }
+  S.drawEdges = S.edges.length > EDGE_BUDGET
+    ? [...S.edges].sort((x, y) => y.shared - x.shared).slice(0, EDGE_BUDGET)
+    : S.edges;
 
   // Positionen über Rebuilds hinweg halten — Filter sollen den Graph verformen,
   // nicht neu würfeln. Neue Knoten setzen sich auf eine Phyllotaxis-Spirale:
@@ -284,33 +303,87 @@ function cluster(nodes) {
 }
 
 /* ===================== FORCE LAYOUT ===================== */
+/* --- Barnes-Hut: Quadtree + genaeherte Fernkraft ---
+ * THETA2 = (Zellbreite/Abstand)²-Schwelle. Ist eine Zelle weit genug weg, zaehlt
+ * sie als ein Koerper mit ihrer Masse statt als n einzelne Knoten. */
+const THETA2 = 0.64;          // theta = 0.8
+const REACH2 = 360000;        // Reichweite der Abstossung (600px), wie bisher
+
+function buildQuad(nodes) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    if (n.x < minX) minX = n.x; if (n.x > maxX) maxX = n.x;
+    if (n.y < minY) minY = n.y; if (n.y > maxY) maxY = n.y;
+  }
+  const w = Math.max(maxX - minX, maxY - minY) || 1;
+  const root = { x: minX, y: minY, w, n: 0, sx: 0, sy: 0, kids: null, node: null };
+  for (const p of nodes) quadInsert(root, p, 0);
+  return root;
+}
+function quadInsert(cell, p, depth) {
+  cell.n++; cell.sx += p.x; cell.sy += p.y;
+  if (cell.n === 1) { cell.node = p; return; }
+  if (depth > 20) return;              // deckungsgleiche Punkte nicht endlos teilen
+  if (!cell.kids) {
+    cell.kids = [];
+    const old = cell.node; cell.node = null;
+    if (old) quadPush(cell, old, depth);
+  }
+  quadPush(cell, p, depth);
+}
+function quadPush(cell, p, depth) {
+  const half = cell.w / 2;
+  const i = (p.x >= cell.x + half ? 1 : 0) + (p.y >= cell.y + half ? 2 : 0);
+  let k = cell.kids[i];
+  if (!k) k = cell.kids[i] = { x: cell.x + (i & 1 ? half : 0),
+    y: cell.y + (i & 2 ? half : 0), w: half, n: 0, sx: 0, sy: 0, kids: null, node: null };
+  quadInsert(k, p, depth + 1);
+}
+function bhRepel(p, dx, dy, d2, mass, alpha) {
+  if (d2 > REACH2) return;
+  if (d2 < .01) { p.x += Math.random() - .5; p.y += Math.random() - .5; return; }
+  // Deckel auf 1/d²: sonst wird die Kraft bei fast deckungsgleichen Knoten
+  // unendlich und schiesst sie aus dem Bild.
+  const d = Math.sqrt(d2), f = Math.min(2.5 * mass, 2400 * mass / d2) * alpha;
+  p.vx += (dx / d) * f; p.vy += (dy / d) * f;
+}
+function bhForce(cell, p, alpha) {
+  if (!cell || !cell.n) return;
+  // Ganzer Ast ausserhalb der Reichweite? Kasten-Abstand pruefen und abschneiden.
+  const ox = Math.max(cell.x - p.x, 0, p.x - (cell.x + cell.w));
+  const oy = Math.max(cell.y - p.y, 0, p.y - (cell.y + cell.w));
+  if (ox * ox + oy * oy > REACH2) return;
+  if (cell.node) {                                   // Blatt mit einem Knoten
+    if (cell.node === p) return;
+    const dx = p.x - cell.node.x, dy = p.y - cell.node.y;
+    bhRepel(p, dx, dy, dx * dx + dy * dy, 1, alpha);
+    return;
+  }
+  const cx = cell.sx / cell.n, cy = cell.sy / cell.n;
+  const dx = p.x - cx, dy = p.y - cy, d2 = dx * dx + dy * dy;
+  if (cell.w * cell.w < d2 * THETA2) {               // weit genug -> ein Koerper
+    bhRepel(p, dx, dy, d2, cell.n, alpha);
+    return;
+  }
+  if (cell.kids) for (const k of cell.kids) bhForce(k, p, alpha);
+}
+
 function tick() {
   if (S.alpha < .004) return false;
   const N = S.nodes;
   if (!N.length) return false;
-  // Exakte Abstossung ueber alle Paare. Ein Nachbarschaftsgitter waere O(n),
-  // hat aber nur lokale Reichweite — dann faellt der ganze Graph zu einer Kugel
-  // zusammen, weil nichts entfernte Cluster auseinanderdrueckt. Bei n≈1.5k sind
-  // die ~1.2M Paare billiger als der Strukturverlust.
-  // ponytail: O(n²) je Tick; ab ~4k Knoten Barnes-Hut nachruesten.
-  for (let i = 0; i < N.length; i++) {
-    const a = N[i];
-    for (let j = i + 1; j < N.length; j++) {
-      const b = N[j];
-      let dx = a.x - b.x, dy = a.y - b.y;
-      let d2 = dx * dx + dy * dy;
-      if (d2 > 360000) continue;                       // >600px: vernachlaessigbar
-      if (d2 < .01) { a.x += Math.random() - .5; a.y += Math.random() - .5; continue; }
-      // Deckel auf 1/d²: sonst wird die Kraft bei fast deckungsgleichen Knoten
-      // unendlich und schiesst sie aus dem Bild.
-      const d = Math.sqrt(d2), f = Math.min(2.5, 2400 / d2) * S.alpha;
-      const fx = (dx / d) * f, fy = (dy / d) * f;
-      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
-    }
-  }
-  const maxS = Math.max(1, ...S.edges.map((e) => e.shared));
+  // Abstossung ueber einen Quadtree (Barnes-Hut): entfernte Knotenwolken wirken
+  // als EIN Koerper in ihrem Schwerpunkt. Ein Nachbarschaftsgitter half hier
+  // nicht — der Graph pendelt sich auf ~2.000 px ein, das sind bei 600-px-Zellen
+  // nur 4x4 Felder, also faktisch wieder alle Paare. Mit dem Baum faellt der Tick
+  // von ~140 ms auf wenige Millisekunden.
+  const root = buildQuad(N);
+  for (const a of N) bhForce(root, a, S.alpha);
+  // Vorberechnet in rebuild(): ein Spread ueber 110k Kanten je Tick waere teuer
+  // und sprengt jenseits ~65k Argumenten den Aufrufstapel.
+  const maxS = S.maxShared || 1;
   for (const e of S.edges) {
-    const a = S.repoById.get(e.src), b = S.repoById.get(e.dst);
+    const a = e.a, b = e.b;
     if (!a || !b || a.x === undefined || b.x === undefined) continue;
     let dx = b.x - a.x, dy = b.y - a.y;
     const d = Math.hypot(dx, dy) || .01;
@@ -399,11 +472,14 @@ function grid() {
 function drawNetwork() {
   const ego = egoSet(), pr = personRepos();
   const focus = ego || pr;
-  const maxS = Math.max(1, ...S.edges.map((e) => e.shared));
+  const maxS = S.maxShared || 1;
   const path = S.trace.path ? new Set(S.trace.path) : null;
 
-  for (const e of S.edges) {
-    const a = S.repoById.get(e.src), b = S.repoById.get(e.dst);
+  // Zeichenbudget: bei 110k Kanten kostet allein das Malen ~100 ms je Frame.
+  // Die schwaechsten Kanten liegen bei alpha .06 ohnehin an der Sichtgrenze —
+  // sie wegzulassen kostet praktisch kein Bild, bringt aber den Faktor 7.
+  for (const e of S.drawEdges) {
+    const a = e.a, b = e.b;
     if (!a || !b) continue;
     const p = T(a), q = T(b);
     if (Math.max(p.x, q.x) < 0 || Math.min(p.x, q.x) > W) continue;
@@ -649,21 +725,28 @@ function hitTest(sx, sy) {
     }
     return best;
   }
-  const p = invT(sx, sy);
+  // Im Bildschirmraum treffen, nicht im Weltraum: gezeichnet wird mit
+  // nodeR()*zoomfaktor, ein Welt-Radius driftet dadurch bei jedem Zoom von der
+  // sichtbaren Scheibe weg (weit rein = zu klein, weit raus = zu gross).
+  // Mindestens 10 px Fangradius, damit auch 2-px-Knoten klickbar bleiben.
   let best = null, bd = Infinity;
   for (const n of S.nodes) {
-    const r = nodeR(n) + 6 / S.view.k;
-    const d = (n.x - p.x) ** 2 + (n.y - p.y) ** 2;
+    const p = T(n);
+    const r = Math.max(nodeR(n) * Math.min(1.9, Math.max(.55, S.view.k)) + 5, 10);
+    const d = (p.x - sx) ** 2 + (p.y - sy) ** 2;
     if (d < r * r && d < bd) { bd = d; best = n; }
   }
   return best;
 }
 
 function wireCanvas() {
-  let pan = null;
+  let pan = null, press = null;
   cv.addEventListener("mousemove", (e) => {
     const r = cv.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    // Erst ab 4 px gilt es als Ziehen — Handzittern soll die Auswahl nicht fressen.
+    if (press && !press.moved &&
+        Math.hypot(sx - press.x, sy - press.y) >= 4) press.moved = true;
     if (pan) {
       if (S.dragging) {
         const p = invT(sx, sy);
@@ -691,23 +774,24 @@ function wireCanvas() {
       cv.style.cursor = "pointer";
     } else { tip.style.opacity = 0; cv.style.cursor = "crosshair"; }
   });
+  // Der beim Druecken getroffene Knoten wird gemerkt und beim Loslassen selektiert.
+  // Vorher: mousedown setzte S.dragging, und mouseup verlangte dragging===null —
+  // ein Klick GENAU auf einen Knoten hat deshalb nie selektiert. Ausserdem lief
+  // der Hit-Test beim Loslassen erneut, obwohl die Simulation den Knoten
+  // zwischenzeitlich wegbewegt hatte. Beides faellt mit `press` weg.
   cv.addEventListener("mousedown", (e) => {
     const r = cv.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
     const h = hitTest(sx, sy);
     pan = { x: sx, y: sy };
+    press = { x: sx, y: sy, node: h, moved: false };
     if (h && S.mode === "network") S.dragging = h;
   });
-  window.addEventListener("mouseup", (e) => {
-    if (pan && S.dragging === null) {
-      const r = cv.getBoundingClientRect();
-      const moved = Math.hypot(e.clientX - r.left - pan.x, e.clientY - r.top - pan.y);
-      if (moved < 4) {
-        const h = hitTest(e.clientX - r.left, e.clientY - r.top);
-        select(h ? { kind: "repo", id: h.id } : null);
-      }
+  window.addEventListener("mouseup", () => {
+    if (press && !press.moved) {
+      select(press.node ? { kind: "repo", id: press.node.id } : null);
     }
-    pan = null; S.dragging = null;
+    press = null; pan = null; S.dragging = null;
   });
   cv.addEventListener("mouseleave", () => { $("tooltip").style.opacity = 0; });
   cv.addEventListener("wheel", (e) => {
@@ -736,6 +820,7 @@ function fit() {
 function select(sel) {
   S.sel = sel;
   paintInspector();
+  paintSteckbrief();
   paint();
 }
 
@@ -915,7 +1000,10 @@ function runTrace() {
 }
 
 /* ===================== DASHBOARD ===================== */
-function paintAll() { paintDash(); refreshClusterSelect(); paintInspector(); paintLegend(); paint(); }
+function paintAll() {
+  paintDash(); refreshClusterSelect(); paintInspector(); paintLegend(); paint();
+  refreshPatterns(); paintSteckbrief(); paintWorld();
+}
 
 function paintDash() {
   const N = S.nodes;
@@ -1191,6 +1279,1186 @@ function refreshClusterSelect() {
       `<option value="${i}"${cur === String(i) ? " selected" : ""}>C${i} · ${S.clusterSizes[i]} Repos</option>`).join("");
 }
 
+/* ===================== SEKTIONS-NAV ===================== */
+function goto(id) {
+  const el = $(id); if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+function wireSectionNav() {
+  document.querySelectorAll(".navbtn[data-goto]").forEach((b) =>
+    b.onclick = () => goto(b.dataset.goto));
+  const secs = ["terminal", "patterns", "world"].map($);
+  const io = new IntersectionObserver((ents) => {
+    for (const e of ents) if (e.isIntersecting) {
+      document.querySelectorAll(".navbtn").forEach((b) =>
+        b.classList.toggle("on", b.dataset.goto === e.target.id));
+    }
+  }, { rootMargin: "-45% 0px -45% 0px" });
+  secs.forEach((s) => s && io.observe(s));
+}
+
+// Aus Muster/Welt zurueck in den Graphen springen.
+function focusRepo(id) {
+  const n = S.repoById.get(id); if (!n) return;
+  select({ kind: "repo", id });
+  if (S.mode !== "network") setMode("network");
+  if (n.x != null) { S.view.x = -n.x; S.view.y = -n.y; S.view.k = Math.max(S.view.k, 1.3); }
+  goto("terminal"); paint();
+}
+function focusPerson(login) { select({ kind: "person", login }); goto("terminal"); }
+
+/* ===================== RELATION PATTERNS ===================== */
+/* Jedes Muster ist eine reine Funktion ueber den aktuell gefilterten Berg
+ * (S.nodes + aktive Personen). Rueckgabe: Schlussfolgerung + Kennzahl + Belege.
+ * Kein Backend — die Vorlage rechnet auf den schon geladenen Daten. */
+function pile() {
+  const repos = S.nodes;
+  const ids = new Set(repos.map((r) => r.id));
+  const ppl = new Map();               // login -> [{repo_id,n}] beschraenkt auf Pile
+  for (const [login, ls] of activePeople()) {
+    const in_ = ls.filter((l) => ids.has(l.repo_id));
+    if (in_.length) ppl.set(login, in_);
+  }
+  return { repos, ids, ppl };
+}
+const short = (id) => S.repoById.get(id)?.short || id;
+
+const PATTERNS = [
+  {
+    id: "busfactor", name: "Klumpenrisiko (Bus-Faktor 1)", tag: "FRAGILITÄT",
+    desc: "Repos, deren Top-Contributor ≥70 % aller erfassten Commits hält — ein Weggang legt das Projekt lahm.",
+    run(p) {
+      const hits = [];
+      for (const r of p.repos) {
+        const ls = S.linksByRepo.get(r.id) || [];
+        if (ls.length < 2) continue;
+        const s = [...ls].sort((a, b) => b.n - a.n);
+        const total = s.reduce((x, l) => x + l.n, 0) || 1;
+        const share = s[0].n / total;
+        if (share >= 0.7) hits.push({ r, top: s[0], share, total, k: ls.length });
+      }
+      hits.sort((a, b) => b.share - a.share);
+      return {
+        verdict: hits.length ? `${hits.length} Repos hängen an einer einzigen Person`
+          : "Kein Klumpenrisiko im aktuellen Filter",
+        stat: hits.length ? "Bus-Faktor 1 · Top-Contributor ≥ 70 % der erfassten Commits" : "",
+        note: "Schlüsselpersonen / Single Point of Failure: ginge diese eine Person, verwaiste das Projekt praktisch.",
+        findings: hits.slice(0, 40).map((h) => ({
+          title: h.r.full_name, badge: `${Math.round(h.share * 100)} %`,
+          sub: `<b>@${h.top.login}</b> · ${fmt(h.top.n)}/${fmt(h.total)} Commits · ${h.k} Mitwirkende`,
+          act: () => focusRepo(h.r.id),
+        })),
+      };
+    },
+  },
+  {
+    id: "cartel", name: "Ko-Maintainer-Kartell", tag: "KOORDINATION",
+    desc: "Personen-Paare, die an ≥3 gemeinsamen Repos zusammen auftauchen — geteilte Kontrolle oder verknüpfte Identitäten.",
+    run(p) {
+      const pm = new Map();
+      for (const r of p.repos) {
+        const u = [...new Set((S.linksByRepo.get(r.id) || []).map((l) => l.login)
+          .filter((l) => !isBot(l)))].sort();
+        if (u.length < 2 || u.length > 60) continue;  // ponytail: O(k²), Fork-Schwaerme deckeln
+        for (let i = 0; i < u.length; i++) for (let j = i + 1; j < u.length; j++) {
+          const k = u[i] + "|" + u[j];
+          let e = pm.get(k); if (!e) pm.set(k, e = { a: u[i], b: u[j], repos: [] });
+          e.repos.push(r.id);
+        }
+      }
+      const hits = [...pm.values()].filter((e) => e.repos.length >= 3)
+        .sort((a, b) => b.repos.length - a.repos.length);
+      return {
+        verdict: hits.length ? `${hits.length} fest gekoppelte Personen-Paare`
+          : "Keine wiederkehrenden Ko-Maintainer-Paare",
+        stat: hits.length ? "Dieselben zwei Konten an ≥3 gemeinsamen Repos" : "",
+        note: "Wiederkehrende Paare deuten auf ein koordiniertes Team, geteilte Kontrolle oder Sockenpuppen hin.",
+        findings: hits.slice(0, 40).map((h) => ({
+          title: `@${h.a} ⋈ @${h.b}`, badge: `${h.repos.length} Repos`,
+          sub: h.repos.slice(0, 7).map(short).join(", ") + (h.repos.length > 7 ? " …" : ""),
+          act: () => focusPerson(h.a),
+        })),
+      };
+    },
+  },
+  {
+    id: "broker", name: "Brücken-Akteure (Broker)", tag: "ZENTRALITÄT",
+    desc: "Personen, deren Repos ≥2 verschiedene Cluster überspannen — sie verbinden sonst getrennte Communities.",
+    run(p) {
+      const hits = [];
+      for (const [login, ls] of p.ppl) {
+        const cs = new Set(); let repos = 0;
+        for (const l of ls) { const c = S.clusters.get(l.repo_id); if (c >= 0) cs.add(c); repos++; }
+        if (cs.size >= 2) hits.push({ login, cs: cs.size, repos });
+      }
+      hits.sort((a, b) => b.cs - a.cs || b.repos - a.repos);
+      return {
+        verdict: hits.length ? `${hits.length} Broker verbinden getrennte Cluster`
+          : "Keine Cluster-übergreifenden Akteure",
+        stat: hits.length ? "Färbung auf ‚Cluster‘ stellen, um die Brücken zu sehen" : "",
+        note: "Broker sind Informationsschleusen und Schlüsselkontakte — und mögliche Sockenpuppen zwischen Lagern.",
+        findings: hits.slice(0, 40).map((h) => ({
+          title: `@${h.login}`, badge: `${h.cs} Cluster`,
+          sub: `${h.repos} Repos im Filter überspannt`,
+          act: () => focusPerson(h.login),
+        })),
+      };
+    },
+  },
+  {
+    id: "forker", name: "Serien-Forker", tag: "HOARDING",
+    desc: "Owner mit ≥3 Fork-Repos im Filter — Mirroring, Hoarding oder aufgeblähte Präsenz statt eigener Arbeit.",
+    run(p) {
+      const m = new Map();
+      for (const r of p.repos) if (r.is_fork) {
+        if (!m.has(r.owner_login)) m.set(r.owner_login, []); m.get(r.owner_login).push(r);
+      }
+      const hits = [...m.entries()].filter(([, rs]) => rs.length >= 3)
+        .sort((a, b) => b[1].length - a[1].length);
+      return {
+        verdict: hits.length ? `${hits.length} Owner sammeln Forks`
+          : "Keine Fork-Sammler (evtl. Forks ausgeblendet)",
+        stat: hits.length ? "≥3 geforkte Repos je Owner im Filter" : "",
+        note: "Viele Forks statt eigener Repos: Spiegelung, Nachziehen fremder Arbeit oder künstliche Aktivität.",
+        findings: hits.slice(0, 40).map(([owner, rs]) => ({
+          title: `@${owner}`, badge: `${rs.length} Forks`,
+          sub: rs.slice(0, 7).map((r) => r.short).join(", ") + (rs.length > 7 ? " …" : ""),
+          act: () => focusRepo(rs[0].id),
+        })),
+      };
+    },
+  },
+  {
+    id: "bots", name: "Bot-betriebene Repos", tag: "AUTOMATION",
+    desc: "Repos, deren Top-Contributor ein Bot ist oder bei denen Bots ≥50 % der Mitwirkenden stellen.",
+    run(p) {
+      const hits = [];
+      for (const r of p.repos) {
+        const ls = S.linksByRepo.get(r.id) || []; if (!ls.length) continue;
+        const bots = ls.filter((l) => isBot(l.login));
+        const top = [...ls].sort((a, b) => b.n - a.n)[0];
+        const ratio = bots.length / ls.length;
+        if (isBot(top.login) || ratio >= 0.5)
+          hits.push({ r, topBot: isBot(top.login), ratio, names: bots.map((b) => b.login) });
+      }
+      hits.sort((a, b) => b.ratio - a.ratio);
+      return {
+        verdict: hits.length ? `${hits.length} Repos werden von Bots getragen`
+          : "Keine bot-dominierten Repos im Filter",
+        stat: hits.length ? "Top-Contributor = Bot, oder ≥50 % Bot-Anteil" : "",
+        note: "Automatisierung statt menschlicher Pflege — Release-Bots, Mirrors, generierte Aktivität.",
+        findings: hits.slice(0, 40).map((h) => ({
+          title: h.r.full_name, badge: `${Math.round(h.ratio * 100)} % Bot`,
+          sub: (h.topBot ? "Top-Contributor ist Bot · " : "") + h.names.slice(0, 4).join(", "),
+          act: () => focusRepo(h.r.id),
+        })),
+      };
+    },
+  },
+  {
+    id: "abandoned", name: "Verwaist, aber einflussreich", tag: "LIEFERKETTE",
+    desc: "Viel-beachtete Repos (oberes Viertel nach Stars) ohne Push seit ≥5 Jahren — Altlasten mit Reichweite.",
+    run(p) {
+      const stars = p.repos.map((r) => r.stars).sort((a, b) => a - b);
+      const thr = Math.max(stars.length ? stars[Math.floor(stars.length * 0.75)] : 0, 50);
+      const cutoff = (S.years.at(-1) || new Date().getFullYear()) - 5;
+      const hits = p.repos.filter((r) => r.stars >= thr && r.pyear != null && r.pyear <= cutoff)
+        .sort((a, b) => b.stars - a.stars);
+      return {
+        verdict: hits.length ? `${hits.length} einflussreiche Repos liegen brach`
+          : "Keine verwaisten Hochwert-Repos im Filter",
+        stat: hits.length ? `≥${fmt(thr)}★ und letzter Push ≤ ${cutoff}` : "",
+        note: "Hohe Sichtbarkeit, keine Pflege: Lieferketten-Risiko und potenziell übernehmbare Namen/Pakete.",
+        findings: hits.slice(0, 40).map((r) => ({
+          title: r.full_name, badge: `${fmt(r.stars)}★`,
+          sub: `letzter Push ${r.pushed_at?.slice(0, 7) || r.pyear} · ${r.lang || "—"}`,
+          act: () => focusRepo(r.id),
+        })),
+      };
+    },
+  },
+  {
+    id: "monoculture", name: "Sprach-Monokultur", tag: "HOMOGENITÄT",
+    desc: "Cluster, in denen ≥80 % der Repos dieselbe Sprache nutzen — technisch homogene Communities.",
+    run(p) {
+      const byC = new Map();
+      for (const r of p.repos) { const c = S.clusters.get(r.id); if (c < 0 || c == null) continue;
+        if (!byC.has(c)) byC.set(c, []); byC.get(c).push(r); }
+      const hits = [];
+      for (const [c, rs] of byC) {
+        if (rs.length < 3) continue;
+        const lc = new Map(); for (const r of rs) { const l = r.lang || "—"; lc.set(l, (lc.get(l) || 0) + 1); }
+        const [lang, n] = [...lc.entries()].sort((a, b) => b[1] - a[1])[0];
+        if (n / rs.length >= 0.8 && lang !== "—") hits.push({ c, lang, share: n / rs.length, size: rs.length });
+      }
+      hits.sort((a, b) => b.size - a.size);
+      return {
+        verdict: hits.length ? `${hits.length} Cluster sind Sprach-Monokulturen`
+          : "Keine monokulturellen Cluster im Filter",
+        stat: hits.length ? "≥80 % der Cluster-Repos in einer Sprache" : "",
+        note: "Homogene Tech-Stacks: gemeinsame Werkzeugkultur, austauschbare Leute, geteilte Abhängigkeiten.",
+        findings: hits.slice(0, 30).map((h) => ({
+          title: `Cluster C${h.c}`, badge: `${h.lang} ${Math.round(h.share * 100)} %`,
+          sub: `${h.size} Repos · dominante Sprache ${h.lang}`,
+          act: () => { F.cluster = String(h.c); $("f_cluster").value = String(h.c); rebuild(); goto("terminal"); },
+        })),
+      };
+    },
+  },
+  {
+    id: "colocation", name: "Ko-Lokation", tag: "GEO", geo: true,
+    desc: "Städte, in denen ≥2 Mitwirkende aus dem Filter sitzen — mögliche physische Nähe oder gemeinsames Team.",
+    run(p) {
+      if (!S.geoByLogin.size) return { verdict: "Noch keine Standortdaten geladen",
+        stat: "", note: "Owner-Profile anreichern:  python -m gitdata enrich  — dann neu laden.", findings: [] };
+      const byCity = new Map();
+      for (const [login] of p.ppl) {
+        const g = personGeo(login); if (!g || !g.city) continue;
+        const k = g.city + " · " + g.country;
+        if (!byCity.has(k)) byCity.set(k, { g, people: [] }); byCity.get(k).people.push(login);
+      }
+      const hits = [...byCity.entries()].filter(([, v]) => v.people.length >= 2)
+        .sort((a, b) => b[1].people.length - a[1].people.length);
+      return {
+        verdict: hits.length ? `${hits.length} Städte bündeln mehrere Akteure`
+          : "Keine Ko-Lokation im Filter (oder zu wenig Geo-Daten)",
+        stat: hits.length ? "≥2 verortete Mitwirkende je Stadt" : "",
+        note: "Gemeinsamer Standort: physische Nähe, gemeinsames Team oder lokale Szene.",
+        findings: hits.slice(0, 40).map(([city, v]) => ({
+          title: city, badge: `${v.people.length} Akteure`,
+          sub: v.people.slice(0, 8).map((l) => "@" + l).join(", ") + (v.people.length > 8 ? " …" : ""),
+          act: () => focusPerson(v.people[0]),
+        })),
+      };
+    },
+  },
+  {
+    id: "deps", name: "Abhängigkeits-Konvergenz", tag: "LIEFERKETTE",
+    desc: "Pakete, von denen ≥3 Repos im Filter abhängen — geteilte Engpässe und gemeinsame Angriffsfläche.",
+    run(p) {
+      const m = new Map();
+      for (const r of p.repos) for (const d of S.depByRepo.get(r.id) || []) {
+        let e = m.get(d.package); if (!e) m.set(d.package, e = { pkg: d.package, eco: d.ecosystem, repos: new Set() });
+        e.repos.add(r.id);
+      }
+      const hits = [...m.values()].filter((e) => e.repos.size >= 3).sort((a, b) => b.repos.size - a.repos.size);
+      return {
+        verdict: hits.length ? `${hits.length} geteilte Abhängigkeiten`
+          : "Keine konvergenten Abhängigkeiten (evtl. kaum SBOM-Daten gecrawlt)",
+        stat: hits.length ? "≥3 abhängige Repos je Paket" : "",
+        note: "Ein kompromittiertes dieser Pakete träfe alle abhängigen Repos zugleich — Lieferketten-Engpass.",
+        findings: hits.slice(0, 40).map((h) => ({
+          title: h.pkg, badge: `${h.repos.size} Repos`,
+          sub: `${h.eco || "—"} · ` + [...h.repos].slice(0, 6).map(short).join(", "),
+          act: () => focusRepo([...h.repos][0]),
+        })),
+      };
+    },
+  },
+];
+
+let _findings = [];
+function buildPatterns() {
+  $("pat-cards").innerHTML = PATTERNS.map((pt) => `
+    <div class="pat-card" data-pat="${pt.id}">
+      <h6>${pt.name}<span class="tag">${pt.tag}</span></h6>
+      <p>${pt.desc}</p>
+    </div>`).join("");
+  $("pat-cards").querySelectorAll("[data-pat]").forEach((el) =>
+    el.onclick = () => runPattern(el.dataset.pat));
+  $("pat-clear").onclick = clearPattern;
+}
+function clearPattern() {
+  S.lastPattern = null; _findings = [];
+  $("pat-result").hidden = true; $("pat-result").innerHTML = "";
+  $("pat-clear").hidden = true;
+  document.querySelectorAll(".pat-card").forEach((c) => c.classList.remove("on"));
+}
+function refreshPatterns() {
+  if (!$("pat-scope")) return;
+  $("pat-scope").textContent =
+    `läuft über ${fmt(S.nodes.length)} Repos · ${fmt(pile().ppl.size)} Personen im Filter`;
+  if (S.lastPattern) runPattern(S.lastPattern, true);
+}
+function runPattern(id, keepScroll) {
+  const pt = PATTERNS.find((x) => x.id === id); if (!pt) return;
+  S.lastPattern = id;
+  document.querySelectorAll(".pat-card").forEach((c) => c.classList.toggle("on", c.dataset.pat === id));
+  const res = pt.run(pile());
+  _findings = res.findings || [];
+  const rows = _findings.length
+    ? `<div class="pat-findings">${_findings.map((f, i) => `
+        <div class="finding" data-f="${i}">
+          <span class="f-title">${f.title}</span><span class="f-badge">${f.badge || ""}</span>
+          <span class="f-sub">${f.sub || ""}</span>
+        </div>`).join("")}</div>`
+    : `<div class="pat-empty">Keine Treffer — Filter oben lockern oder ein anderes Muster wählen.</div>`;
+  $("pat-result").hidden = false;
+  $("pat-clear").hidden = false;
+  $("pat-result").innerHTML = `
+    <div class="pat-verdict">
+      <h3>${res.verdict}</h3>
+      ${res.stat ? `<div class="stat">${res.stat}</div>` : ""}
+      <div class="note">${res.note}</div>
+    </div>${rows}`;
+  $("pat-result").querySelectorAll("[data-f]").forEach((el) =>
+    el.onclick = () => _findings[+el.dataset.f]?.act?.());
+  if (!keepScroll) goto("patterns");
+}
+
+/* ===================== STECKBRIEF (Auswahl in Saetzen) ===================== */
+/* Aus den Rohwerten der Auswahl werden ganze deutsche Saetze gebaut — die
+ * Tabellen im Inspektor sagen WAS, der Steckbrief sagt WAS DAS HEISST. */
+const MONTHS = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
+  "August", "September", "Oktober", "November", "Dezember"];
+const monthYear = (s) => s ? `${MONTHS[+s.slice(5, 7) - 1]} ${s.slice(0, 4)}` : null;
+const plural = (n, one, many) => `${fmt(n)} ${n === 1 ? one : many}`;
+const B = (s) => `<b>${s}</b>`;
+const rlink = (id, label) => `<u data-repo="${id}">${label}</u>`;
+const plink = (login) => `<u data-person="${login}">@${login}</u>`;
+
+function pctRank(val, arr) {           // Anteil der Menge, der kleiner ist
+  if (!arr.length) return 0;
+  let below = 0;
+  for (const v of arr) if (v < val) below++;
+  return below / arr.length;
+}
+
+function sbRepo(r) {
+  if (!r) return "";
+  const g = repoGeo(r);
+  const contribs = (S.linksByRepo.get(r.id) || []).slice().sort((a, b) => b.n - a.n);
+  const totalC = contribs.reduce((s, c) => s + c.n, 0);
+  const nb = (S.adj.get(r.id) || []).slice().sort((a, b) => b.w - a.w);
+  const cl = S.clusters.get(r.id);
+  const owner = S.people.get(r.owner_login);
+  const kind = r.owner_type === "Organization" ? "der Organisation" : "des Nutzers";
+  const S_ = [];
+
+  // 1 — Identität, Herkunft, Lizenz
+  let s1 = `${B(r.full_name)} ist ein ${r.lang ? B(r.lang) + "-Projekt" : "Projekt"} ` +
+    `${kind} ${plink(r.owner_login)}`;
+  s1 += g ? `, ${g.city ? `ansässig in ${B(g.city)}, ${B(g.country)}` : `aus ${B(g.country)}`}` : "";
+  s1 += r.license ? `, veröffentlicht unter ${B(r.license)}.` : ", ohne hinterlegte Lizenz.";
+  S_.push(s1);
+
+  // 2 — Reichweite mit Perzentil
+  const p = Math.round(pctRank(r.stars, S.nodes.map((n) => n.stars)) * 100);
+  S_.push(`Es sammelt ${B(fmt(r.stars) + " Stars")} und ${B(fmt(r.forks) + " Forks")} ` +
+    `und liegt damit über ${B(p + " %")} der ${fmt(S.nodes.length)} gefilterten Repos.`);
+
+  // 3 — Aktivität
+  const py = r.pyear, now = S.years.at(-1) || new Date().getFullYear();
+  const age = py ? now - py : null;
+  if (monthYear(r.pushed_at)) {
+    S_.push(age >= 5
+      ? `Der letzte Push liegt im ${B(monthYear(r.pushed_at))} — seit rund ${B(age + " Jahren")} ` +
+        `bewegt sich nichts mehr, das Projekt gilt als <em>verwaist</em>.`
+      : `Zuletzt bewegt wurde es im ${B(monthYear(r.pushed_at))}` +
+        (monthYear(r.created_at) ? `, angelegt im ${B(monthYear(r.created_at))}.` : "."));
+  }
+
+  // 4 — Menschen + Klumpenrisiko
+  if (contribs.length) {
+    const top = contribs[0], share = totalC ? top.n / totalC : 0;
+    let s = `Erfasst sind ${B(plural(contribs.length, "mitwirkende Person", "mitwirkende Personen"))}; ` +
+      `${plink(top.login)} stellt davon ${B(Math.round(share * 100) + " %")} der Commits`;
+    s += share >= .7 && contribs.length > 1
+      ? ` — ein <em>Klumpenrisiko</em>: fällt diese Person aus, verwaist das Projekt faktisch.`
+      : `.`;
+    S_.push(s);
+  } else {
+    S_.push(`Zu diesem Repo sind ${B("keine Contributor-Daten")} gecrawlt.`);
+  }
+
+  // 5 — Netz
+  S_.push(nb.length
+    ? `Über gemeinsame Mitwirkende hängt es an ${B(plural(nb.length, "weiteren Projekt", "weiteren Projekten"))}, ` +
+      `am engsten an ${rlink(nb[0].id, S.repoById.get(nb[0].id)?.full_name || nb[0].id)} ` +
+      `(${plural(nb[0].w, "gemeinsame Person", "gemeinsame Personen")}).`
+    : `Im aktuellen Filter teilt es mit ${B("keinem")} anderen Projekt Mitwirkende — es steht isoliert.`);
+
+  // 6 — Cluster + Flags
+  if (cl >= 0) S_.push(`Zugeordnet ist es Cluster ${B("C" + cl)}, der ` +
+    `${plural(S.clusterSizes?.[cl] || 0, "Repo", "Repos")} umfasst.`);
+  const flags = [r.archived && "archiviert", r.is_fork && "ein Fork"].filter(Boolean);
+  if (flags.length) S_.push(`Das Repo ist ${B(flags.join(" und "))}.`);
+
+  const facts = [
+    ["SPRACHE", r.lang || "—"], ["STARS", fmt(r.stars)], ["FORKS", fmt(r.forks)],
+    ["ISSUES", fmt(r.open_issues)], ["CONTRIB", contribs.length], ["LINKS", r.deg ?? 0],
+    g && ["ORT", (g.city ? g.city + ", " : "") + g.country],
+    r.topics?.length && ["TOPICS", r.topics.slice(0, 3).join(", ")],
+  ].filter(Boolean);
+
+  return `
+    <div class="sb-head"><span class="sb-kind">STECKBRIEF · REPO</span>
+      <span class="sb-name">${r.full_name}</span></div>
+    <div class="sb-text">${S_.join(" ")}</div>
+    <div class="sb-facts">${facts.map(([k, v]) => `<span><i>${k}</i>${v}</span>`).join("")}</div>`;
+}
+
+function sbPerson(login) {
+  const p = S.people.get(login) || { repos: 0, total: 0 };
+  const g = personGeo(login);
+  const ls = (S.linksByPerson.get(login) || []).slice().sort((a, b) => b.n - a.n);
+  const inFilter = ls.filter((l) => S.repoById.get(l.repo_id) && S.nodes.some((n) => n.id === l.repo_id));
+  const langs = new Map(), clusters = new Set(), mates = new Map();
+  for (const l of ls) {
+    const r = S.repoById.get(l.repo_id); if (!r) continue;
+    if (r.lang) langs.set(r.lang, (langs.get(r.lang) || 0) + 1);
+    const c = S.clusters.get(r.id); if (c >= 0) clusters.add(c);
+    for (const o of S.linksByRepo.get(r.id) || [])
+      if (o.login !== login && !isBot(o.login)) mates.set(o.login, (mates.get(o.login) || 0) + 1);
+  }
+  const topLang = [...langs.entries()].sort((a, b) => b[1] - a[1])[0];
+  const topMates = [...mates.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+  const S_ = [];
+
+  let s1 = `${B("@" + login)} ist ${isBot(login) ? "ein " + B("Bot-Konto")
+    : p.type === "Organization" ? "eine " + B("Organisation") : "ein " + B("Nutzerkonto")}`;
+  s1 += g ? `, ${g.city ? `ansässig in ${B(g.city)}, ${B(g.country)}` : `aus ${B(g.country)}`}.` : ".";
+  S_.push(s1);
+
+  S_.push(`Erfasst ist die Mitarbeit an ${B(plural(p.repos, "Projekt", "Projekten"))} ` +
+    `mit zusammen ${B(plural(p.total, "Commit", "Commits"))}` +
+    (inFilter.length !== p.repos ? `, davon ${B(inFilter.length)} im aktuellen Filter.` : `.`));
+
+  if (topLang) S_.push(`Der Schwerpunkt liegt auf ${B(topLang[0])} ` +
+    `(${topLang[1]} von ${ls.length} Projekten).`);
+
+  if (ls.length) {
+    const t = S.repoById.get(ls[0].repo_id);
+    if (t) S_.push(`Am stärksten engagiert ist das Konto in ` +
+      `${rlink(t.id, t.full_name)} mit ${B(plural(ls[0].n, "Commit", "Commits"))}.`);
+  }
+
+  S_.push(clusters.size >= 2
+    ? `Die Arbeit verteilt sich über ${B(plural(clusters.size, "Cluster", "Cluster"))} — ` +
+      `das Konto wirkt als <em>Brücke</em> zwischen sonst getrennten Gruppen.`
+    : clusters.size === 1
+      ? `Die Arbeit bleibt innerhalb eines einzigen Clusters.`
+      : `Im aktuellen Filter lässt sich kein Cluster zuordnen.`);
+
+  if (topMates.length) S_.push(`Häufigste Mitstreiter: ` +
+    topMates.map(([m, n]) => `${plink(m)} (${n})`).join(", ") + `.`);
+
+  const facts = [
+    ["TYP", p.type || "User"], ["PROJEKTE", fmt(p.repos)], ["COMMITS", fmt(p.total)],
+    ["SPRACHEN", langs.size], ["CLUSTER", clusters.size],
+    g && ["ORT", (g.city ? g.city + ", " : "") + g.country],
+  ].filter(Boolean);
+
+  return `
+    <div class="sb-head"><span class="sb-kind">STECKBRIEF · PERSON</span>
+      <span class="sb-name">@${login}</span></div>
+    <div class="sb-text">${S_.join(" ")}</div>
+    <div class="sb-facts">${facts.map(([k, v]) => `<span><i>${k}</i>${v}</span>`).join("")}</div>`;
+}
+
+function paintSteckbrief() {
+  const el = $("steckbrief"); if (!el) return;
+  if (!S.sel) {
+    el.className = "sb empty";
+    el.innerHTML = `<div class="sb-hint">Nichts ausgewählt — klick einen Knoten im Graphen, ` +
+      `eine Person in den Ranglisten oder einen Beleg unten. Hier erscheint dann ein ` +
+      `Steckbrief in ganzen Sätzen.</div>`;
+    return;
+  }
+  el.className = "sb";
+  el.innerHTML = S.sel.kind === "repo" ? sbRepo(S.repoById.get(S.sel.id)) : sbPerson(S.sel.login);
+  el.querySelectorAll("[data-repo]").forEach((a) =>
+    a.onclick = () => focusRepo(+a.dataset.repo));
+  el.querySelectorAll("[data-person]").forEach((a) =>
+    a.onclick = () => select({ kind: "person", login: a.dataset.person }));
+}
+
+/* ===================== WORLD VIEW · GLOBUS ===================== */
+/* Echte Ländergrenzen (web/world-110m.json, Natural Earth 110m, lokal — kein
+ * CDN, keine Bibliothek). Zwei Projektionen teilen sich Zeichnung und Treffer-
+ * tests: orthographisch (drehbarer Globus) und äquirektangular (flache Karte).
+ *
+ * Perf: sin/cos je Stützpunkt werden EINMAL beim Laden vorgerechnet. Die
+ * Projektion pro Frame ist danach reine Multiplikation — sonst kosten ~30k
+ * Grad→Bogenmaß-Umrechnungen je Frame mehr als das ganze Force-Layout.
+ */
+const RAD = Math.PI / 180;
+const W3 = {
+  mode: "repos", proj: "globe", cv: null, ctx: null, W: 0, H: 0, DPR: 1,
+  rot: { lam: -30, phi: 15 },     // Zentrum der Ansicht in Grad
+  zoom: 1, spin: true, lastUser: 0,
+  world: null, cities: [], countries: [], located: 0, total: 0,
+  sel: null,                       // {iso, country} | null
+  selCity: null,
+  hitMarkers: [],
+  anim: null, dirty: true, loaded: false,
+};
+const wrapLon = (d) => ((d + 180) % 360 + 360) % 360 - 180;
+const R_of = () => Math.min(W3.W, W3.H) * 0.44 * W3.zoom;
+
+/* --- Geometrie laden + Trigonometrie vorrechnen --- */
+async function loadWorldGeometry() {
+  try {
+    const raw = await fetch("world-110m.json").then((r) => r.json());
+    for (const f of raw.features) {
+      f.rings = [];
+      for (const poly of f.p) for (const ring of poly) {
+        const n = ring.length, a = new Float64Array(n * 6);
+        for (let i = 0; i < n; i++) {
+          const lon = ring[i][0], lat = ring[i][1];
+          const λ = lon * RAD, φ = lat * RAD, o = i * 6;
+          a[o] = lon; a[o + 1] = lat;
+          a[o + 2] = Math.sin(λ); a[o + 3] = Math.cos(λ);
+          a[o + 4] = Math.sin(φ); a[o + 5] = Math.cos(φ);
+        }
+        f.rings.push(a);
+      }
+    }
+    W3.world = raw.features;
+    W3.loaded = true;
+  } catch (e) {
+    W3.loaded = false;            // Karte fehlt -> nur Gitter + Marker
+  }
+  W3.dirty = true;
+}
+
+/* --- Projektion: (lat,lon) -> Bildschirm, null = abgewandte Seite --- */
+function wproj(lat, lon) {
+  const cx = W3.W / 2, cy = W3.H / 2;
+  if (W3.proj === "flat") {
+    const kx = (W3.W / 360) * W3.zoom, ky = (W3.H / 180) * W3.zoom;
+    return { x: cx + wrapLon(lon - W3.rot.lam) * kx, y: cy - (lat - W3.rot.phi) * ky };
+  }
+  const λ = (lon - W3.rot.lam) * RAD, φ = lat * RAD, φ0 = W3.rot.phi * RAD;
+  const sinφ = Math.sin(φ), cosφ = Math.cos(φ);
+  const sinφ0 = Math.sin(φ0), cosφ0 = Math.cos(φ0);
+  const cosλ = Math.cos(λ), sinλ = Math.sin(λ);
+  if (sinφ0 * sinφ + cosφ0 * cosφ * cosλ < 0) return null;   // Rückseite
+  const R = R_of();
+  return { x: cx + R * cosφ * sinλ, y: cy - R * (cosφ0 * sinφ - sinφ0 * cosφ * cosλ) };
+}
+
+/* --- Umkehrung: Bildschirm -> (lat,lon), null = daneben --- */
+function wunproj(sx, sy) {
+  const cx = W3.W / 2, cy = W3.H / 2;
+  if (W3.proj === "flat") {
+    const kx = (W3.W / 360) * W3.zoom, ky = (W3.H / 180) * W3.zoom;
+    return { lat: W3.rot.phi - (sy - cy) / ky, lon: wrapLon(W3.rot.lam + (sx - cx) / kx) };
+  }
+  const R = R_of(), dx = sx - cx, dy = cy - sy;
+  const rho = Math.hypot(dx, dy);
+  if (rho > R) return null;
+  const c = Math.asin(Math.min(1, rho / R));
+  const sinc = Math.sin(c), cosc = Math.cos(c), φ0 = W3.rot.phi * RAD;
+  const lat = Math.asin(cosc * Math.sin(φ0) + (rho ? dy * sinc * Math.cos(φ0) / rho : 0)) / RAD;
+  const lon = W3.rot.lam + Math.atan2(dx * sinc,
+    rho * cosc * Math.cos(φ0) - dy * sinc * Math.sin(φ0)) / RAD;
+  return { lat, lon: wrapLon(lon) };
+}
+
+/* --- Daten: Pile -> Länder + Städte --- */
+function worldData() {
+  const byCountry = new Map(), byCity = new Map();
+  let located = 0, total = 0;
+  const add = (g, item) => {
+    let c = byCountry.get(g.country);
+    if (!c) byCountry.set(g.country, c = { country: g.country, n: 0, noCity: 0,
+      items: [], cities: new Map() });
+    c.n++; c.items.push(item);
+    if (!g.city) { c.noCity++; return; }   // nur Land bekannt -> kein Ortsmarker
+    const ck = g.city + "|" + g.country;
+    let k = byCity.get(ck);
+    if (!k) byCity.set(ck, k = { key: ck, city: g.city, country: g.country,
+      lat: g.lat, lon: g.lon, n: 0, items: [] });
+    k.n++; k.items.push(item);
+    c.cities.set(ck, k);
+  };
+  if (W3.mode === "repos") {
+    for (const r of S.nodes) { total++; const g = repoGeo(r); if (g) { add(g, r.id); located++; } }
+  } else {
+    for (const [login] of pile().ppl) { total++; const g = personGeo(login); if (g) { add(g, login); located++; } }
+  }
+  W3.countries = [...byCountry.values()].sort((a, b) => b.n - a.n);
+  W3.cities = [...byCity.values()].sort((a, b) => b.n - a.n);
+  W3.located = located; W3.total = total;
+  W3.noCity = W3.countries.reduce((s, c) => s + c.noCity, 0);
+}
+
+/* --- Zeichnen --- */
+function drawWorld() {
+  const { ctx, W, H, DPR } = W3;
+  if (!ctx || !W) return;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2, R = R_of(), globe = W3.proj === "globe";
+
+  if (globe) {                       // Ozean + Terminator-Glow
+    const grd = ctx.createRadialGradient(cx - R * .3, cy - R * .3, R * .1, cx, cy, R);
+    grd.addColorStop(0, "#0d2733"); grd.addColorStop(1, "#061119");
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7); ctx.fillStyle = grd; ctx.fill();
+    ctx.strokeStyle = "#2ee6cf55"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+
+  ctx.save();
+  if (globe) { ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7); ctx.clip(); }
+
+  // Gradnetz
+  ctx.strokeStyle = "#1b3a46"; ctx.lineWidth = .6;
+  ctx.beginPath();
+  for (let lon = -180; lon <= 180; lon += 30) {
+    let up = false;
+    for (let lat = -90; lat <= 90; lat += 3) {
+      const p = wproj(lat, lon);
+      if (!p) { up = false; continue; }
+      up ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y); up = true;
+    }
+  }
+  for (let lat = -60; lat <= 60; lat += 30) {
+    let up = false;
+    for (let lon = -180; lon <= 180; lon += 3) {
+      const p = wproj(lat, lon);
+      if (!p) { up = false; continue; }
+      up ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y); up = true;
+    }
+  }
+  ctx.stroke();
+
+  // Länder
+  if (W3.world) {
+    const λ0 = W3.rot.lam * RAD, φ0 = W3.rot.phi * RAD;
+    const sinλ0 = Math.sin(λ0), cosλ0 = Math.cos(λ0);
+    const sinφ0 = Math.sin(φ0), cosφ0 = Math.cos(φ0);
+    const kx = (W / 360) * W3.zoom, ky = (H / 180) * W3.zoom;
+    for (const f of W3.world) {
+      const on = W3.sel && W3.sel.iso && f.iso === W3.sel.iso;
+      const hasData = W3.countryByIso?.get(f.iso);
+      ctx.beginPath();
+      let any = false;
+      for (const a of f.rings) {
+        let started = false;
+        for (let i = 0; i < a.length; i += 6) {
+          let x, y;
+          if (globe) {
+            const sinλ = a[i + 2] * cosλ0 - a[i + 3] * sinλ0;   // sin(λ-λ0)
+            const cosλ = a[i + 3] * cosλ0 + a[i + 2] * sinλ0;   // cos(λ-λ0)
+            const sinφ = a[i + 4], cosφ = a[i + 5];
+            if (sinφ0 * sinφ + cosφ0 * cosφ * cosλ < 0) { started = false; continue; }
+            x = cx + R * cosφ * sinλ;
+            y = cy - R * (cosφ0 * sinφ - sinφ0 * cosφ * cosλ);
+          } else {
+            x = cx + wrapLon(a[i] - W3.rot.lam) * kx;
+            y = cy - (a[i + 1] - W3.rot.phi) * ky;
+          }
+          started ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+          started = true; any = true;
+        }
+        ctx.closePath();
+      }
+      if (!any) continue;
+      ctx.fillStyle = on ? "#ffc06126" : hasData ? "#14323d" : "#0e222b";
+      ctx.fill();
+      ctx.strokeStyle = on ? AM : hasData ? "#3d7d90" : "#25454f";
+      ctx.lineWidth = on ? 1.6 : .7;
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+
+  // Marker: Städte
+  W3.hitMarkers = [];
+  const max = Math.max(1, ...W3.cities.map((c) => c.n));
+  for (const c of W3.cities) {
+    const p = wproj(c.lat, c.lon);
+    if (!p || p.x < -40 || p.x > W + 40 || p.y < -40 || p.y > H + 40) continue;
+    const r = 2.5 + 11 * Math.sqrt(c.n / max);
+    const on = W3.selCity === c.key;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7);
+    ctx.fillStyle = on ? "#ffc06188" : "#28f5d855";
+    ctx.strokeStyle = on ? AM : CY; ctx.lineWidth = on ? 2 : 1;
+    ctx.fill(); ctx.stroke();
+    if (on || r > 9) {
+      ctx.fillStyle = on ? "#fff" : BRIGHT; ctx.font = F_MATRIX; ctx.textAlign = "center";
+      ctx.fillText(fmt(c.n), p.x, p.y + 3.5);
+    }
+    if (on && c.city) {
+      ctx.fillStyle = AM; ctx.font = F_AXIS; ctx.textAlign = "center";
+      ctx.fillText(c.city, p.x, p.y - r - 6);
+    }
+    W3.hitMarkers.push({ c, x: p.x, y: p.y, r: Math.max(r, 7) });
+  }
+  ctx.textAlign = "left";
+
+  $("world-readout").textContent =
+    `${W3.mode === "repos" ? "REPOS" : "AKTEURE"} · ${fmt(W3.located)}/${fmt(W3.total)} verortet · ` +
+    `${W3.countries.length} Länder · ${W3.proj === "globe" ? "Ziehen dreht, Rad zoomt" : "Ziehen verschiebt"}`;
+}
+
+/* --- Flug zu einem Ort --- */
+const ease = (t) => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+function flyTo(lat, lon, zoom) {
+  W3.anim = {
+    t0: performance.now(), dur: 850,
+    from: { lam: W3.rot.lam, phi: W3.rot.phi, z: W3.zoom },
+    d: { lam: wrapLon(lon - W3.rot.lam), phi: lat - W3.rot.phi, z: (zoom ?? W3.zoom) - W3.zoom },
+  };
+  W3.lastUser = performance.now();   // Auto-Spin nicht sofort dazwischenfunken
+}
+
+/* --- Seitenlisten --- */
+function paintWorldSide() {
+  const pct = W3.total ? Math.round(W3.located / W3.total * 100) : 0;
+  $("world-cov").innerHTML = `
+    <div class="covrow"><span>verortet</span><b>${fmt(W3.located)} / ${fmt(W3.total)}</b></div>
+    <div class="bar"><i style="width:${pct}%"></i></div>
+    <div class="covrow"><span>Länder</span><b>${W3.countries.length}</b></div>
+    <div class="covrow"><span>Städte</span><b>${W3.cities.length}</b></div>
+    <div class="covrow"><span>nur Land, ohne Stadt</span><b>${fmt(W3.noCity || 0)}</b></div>
+    <div class="covrow"><span>Owner mit Geo</span><b>${fmt(S.geoByLogin.size)}</b></div>`;
+
+  const cmax = Math.max(1, ...W3.countries.map((c) => c.n));
+  $("world-countries").innerHTML = W3.countries.slice(0, 40).map((c) => `
+    <div class="wc-row ${W3.sel?.country === c.country ? "on" : ""}" data-country="${c.country}">
+      <i class="dot" style="background:${ramp(c.n / cmax)}"></i>
+      <span class="nm">${c.country}</span><span class="ct">${fmt(c.n)}</span>
+    </div>`).join("") || '<div class="hint">keine Geo-Daten — python -m gitdata enrich</div>';
+  $("world-countries").querySelectorAll("[data-country]").forEach((el) =>
+    el.onclick = () => selectCountry(el.dataset.country));
+
+  let list = W3.cities;
+  if (W3.sel) list = list.filter((c) => c.country === W3.sel.country);
+  const kmax = Math.max(1, ...list.map((c) => c.n));
+  $("world-cities").innerHTML = list.slice(0, 40).map((c) => `
+    <div class="wc-row ${W3.selCity === c.key ? "on" : ""}" data-city="${c.key}">
+      <i class="dot" style="background:${ramp(c.n / kmax)}"></i>
+      <span class="nm">${c.city}<span class="dim"> · ${c.country}</span></span>
+      <span class="ct">${fmt(c.n)}</span>
+    </div>`).join("") || '<div class="hint">keine Stadtdaten</div>';
+  $("world-cities").querySelectorAll("[data-city]").forEach((el) =>
+    el.onclick = () => selectCity(el.dataset.city));
+
+  paintWorldDrill();
+}
+
+/* Drill-Down: WER/WAS sitzt konkret an dem gewaehlten Ort. Die Karte zeigt nur
+ * Zahlen — hier stehen die tatsaechlichen Repos bzw. Personen, anklickbar. */
+function paintWorldDrill() {
+  const head = $("world-drill-h"), box = $("world-drill");
+  let items = [], label = null;
+  if (W3.selCity) {
+    const c = W3.cities.find((x) => x.key === W3.selCity);
+    if (c) { items = c.items; label = `${c.city || "unbekannter Ort"} · ${c.country}`; }
+  } else if (W3.sel) {
+    const c = W3.countries.find((x) => x.country === W3.sel.country);
+    if (c) { items = c.items; label = c.country; }
+  }
+  if (!label) {
+    head.innerHTML = `VON HIER <i>Ort wählen</i>`;
+    box.innerHTML = `<div class="hint">Land oder Stadt anklicken (Karte oder Liste) — hier
+      erscheinen dann die ${W3.mode === "repos" ? "Repos" : "Personen"} von dort.</div>`;
+    return;
+  }
+  head.innerHTML = `VON HIER <i>${label} · ${fmt(items.length)}</i>`;
+
+  if (W3.mode === "repos") {
+    const rows = items.map((id) => S.repoById.get(id)).filter(Boolean)
+      .sort((a, b) => b.stars - a.stars);
+    box.innerHTML = rows.slice(0, 60).map((r) => `
+      <div class="drill-row" data-drepo="${r.id}">
+        <span class="nm">${r.full_name}</span><span class="mt">${fmt(r.stars)}★</span>
+        <span class="sub">${r.lang || "—"} · @${r.owner_login}${r.deg ? ` · ${r.deg} Links` : ""}</span>
+      </div>`).join("") + (rows.length > 60 ? `<div class="hint">… ${rows.length - 60} weitere</div>` : "");
+    box.querySelectorAll("[data-drepo]").forEach((el) =>
+      el.onclick = () => focusRepo(+el.dataset.drepo));
+  } else {
+    const rows = items.map((login) => ({ login, p: S.people.get(login) || { repos: 0, total: 0 } }))
+      .sort((a, b) => b.p.total - a.p.total);
+    box.innerHTML = rows.slice(0, 60).map(({ login, p }) => `
+      <div class="drill-row" data-dperson="${login}">
+        <span class="nm">@${login}</span><span class="mt">${fmt(p.total)}</span>
+        <span class="sub">${p.repos} Projekte${p.type && p.type !== "User" ? " · " + p.type : ""}</span>
+      </div>`).join("") + (rows.length > 60 ? `<div class="hint">… ${rows.length - 60} weitere</div>` : "");
+    box.querySelectorAll("[data-dperson]").forEach((el) =>
+      el.onclick = () => select({ kind: "person", login: el.dataset.dperson }));
+  }
+}
+
+function selectCountry(country) {
+  if (W3.sel?.country === country) { W3.sel = null; W3.selCity = null; }
+  else {
+    const iso = S.isoByCountry?.get(country) || null;
+    W3.sel = { country, iso }; W3.selCity = null;
+    const c = W3.countries.find((x) => x.country === country);
+    const big = c && [...c.cities.values()].sort((a, b) => b.n - a.n)[0];
+    if (big) flyTo(big.lat, big.lon, W3.proj === "globe" ? 1.9 : 2.4);
+  }
+  W3.dirty = true; paintWorldSide();
+}
+function selectCity(key) {
+  const c = W3.cities.find((x) => x.key === key); if (!c) return;
+  W3.selCity = W3.selCity === key ? null : key;
+  if (W3.selCity) {
+    W3.sel = { country: c.country, iso: S.isoByCountry?.get(c.country) || null };
+    flyTo(c.lat, c.lon, W3.proj === "globe" ? 2.6 : 3.4);
+  }
+  W3.dirty = true; paintWorldSide();
+}
+
+/* --- Öffentliche Auffrischung (aus paintAll) --- */
+function paintWorld() {
+  if (!W3.ctx) return;
+  worldData();
+  W3.countryByIso = new Map();
+  for (const c of W3.countries) {
+    const iso = S.isoByCountry?.get(c.country); if (iso) W3.countryByIso.set(iso, c);
+  }
+  paintWorldSide();
+  W3.dirty = true;
+}
+
+/* --- Aufbau + Interaktion --- */
+function buildWorld() {
+  W3.cv = $("worldmap"); W3.ctx = W3.cv.getContext("2d");
+  document.querySelectorAll("[data-wproj]").forEach((b) => b.onclick = () => {
+    W3.proj = b.dataset.wproj;
+    document.querySelectorAll("[data-wproj]").forEach((x) => x.classList.toggle("on", x === b));
+    W3.zoom = 1; W3.rot = { lam: W3.rot.lam, phi: W3.proj === "flat" ? 0 : 15 };
+    W3.dirty = true;
+  });
+  document.querySelectorAll("[data-wmode]").forEach((b) => b.onclick = () => {
+    W3.mode = b.dataset.wmode; W3.selCity = null;
+    document.querySelectorAll("[data-wmode]").forEach((x) => x.classList.toggle("on", x === b));
+    paintWorld();
+  });
+  $("w_spin").onclick = () => {
+    W3.spin = !W3.spin; $("w_spin").classList.toggle("on", W3.spin);
+  };
+  $("w_reset").onclick = () => {
+    W3.sel = null; W3.selCity = null; W3.zoom = 1;
+    flyTo(15, -30, 1); paintWorldSide();
+  };
+  wireWorld();
+  worldResize();
+  loadWorldGeometry();
+  requestAnimationFrame(worldLoop);
+}
+
+function worldResize() {
+  if (!W3.cv) return;
+  W3.DPR = Math.min(2, window.devicePixelRatio || 1);
+  const r = W3.cv.getBoundingClientRect();
+  W3.W = r.width; W3.H = r.height;
+  W3.cv.width = W3.W * W3.DPR; W3.cv.height = W3.H * W3.DPR;
+  W3.dirty = true;
+}
+
+function worldVisible() {
+  const r = $("world").getBoundingClientRect();
+  return r.bottom > 0 && r.top < innerHeight;
+}
+
+function worldLoop() {
+  const t = performance.now();
+  if (W3.anim) {
+    const k = Math.min(1, (t - W3.anim.t0) / W3.anim.dur), e = ease(k);
+    W3.rot.lam = wrapLon(W3.anim.from.lam + W3.anim.d.lam * e);
+    W3.rot.phi = clamp(W3.anim.from.phi + W3.anim.d.phi * e, -85, 85);
+    W3.zoom = W3.anim.from.z + W3.anim.d.z * e;
+    if (k >= 1) W3.anim = null;
+    W3.dirty = true;
+  } else if (W3.spin && W3.proj === "globe" && t - W3.lastUser > 2200) {
+    W3.rot.lam = wrapLon(W3.rot.lam + .09);
+    W3.dirty = true;
+  }
+  if (W3.dirty && worldVisible()) { drawWorld(); W3.dirty = false; }
+  requestAnimationFrame(worldLoop);
+}
+
+function wireWorld() {
+  const cv = W3.cv;
+  let drag = null;
+  cv.addEventListener("mousedown", (e) => {
+    const r = cv.getBoundingClientRect();
+    drag = { x: e.clientX - r.left, y: e.clientY - r.top, moved: false };
+    W3.lastUser = performance.now();
+  });
+  cv.addEventListener("mousemove", (e) => {
+    const r = cv.getBoundingClientRect();
+    const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    if (drag) {
+      const dx = sx - drag.x, dy = sy - drag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+      const k = W3.proj === "globe" ? 0.28 / W3.zoom : 360 / (W3.W * W3.zoom);
+      W3.rot.lam = wrapLon(W3.rot.lam - dx * k);
+      W3.rot.phi = clamp(W3.rot.phi + dy * (W3.proj === "globe" ? 0.28 / W3.zoom
+        : 180 / (W3.H * W3.zoom)), -85, 85);
+      drag.x = sx; drag.y = sy;
+      W3.lastUser = performance.now(); W3.anim = null; W3.dirty = true;
+      cv.style.cursor = "grabbing";
+      return;
+    }
+    // Hover: Stadt-Marker, sonst Land
+    let hit = null;
+    for (const m of W3.hitMarkers)
+      if ((m.x - sx) ** 2 + (m.y - sy) ** 2 <= m.r * m.r) { hit = m; break; }
+    const tip = $("worldtip");
+    if (hit) {
+      const c = hit.c;
+      tip.innerHTML = `<b>${c.city || "unbekannter Ort"}</b> · ${c.country}<br>
+        <s>${W3.mode === "repos" ? "REPOS" : "AKTEURE"}</s> ${fmt(c.n)}<br>
+        <s>KLICK</s> hinfliegen &amp; filtern`;
+      tip.style.opacity = 1;
+      tip.style.left = Math.min(e.clientX + 14, innerWidth - 250) + "px";
+      tip.style.top = (e.clientY + 14) + "px";
+      cv.style.cursor = "pointer";
+    } else {
+      const geo = wunproj(sx, sy);
+      const f = geo && W3.world && featureAt(geo.lat, geo.lon);
+      const rec = f && W3.countryByIso?.get(f.iso);
+      if (f) {
+        tip.innerHTML = `<b>${f.n}</b><br><s>${W3.mode === "repos" ? "REPOS" : "AKTEURE"}</s> ` +
+          `${rec ? fmt(rec.n) : "0"}`;
+        tip.style.opacity = 1;
+        tip.style.left = Math.min(e.clientX + 14, innerWidth - 250) + "px";
+        tip.style.top = (e.clientY + 14) + "px";
+        cv.style.cursor = rec ? "pointer" : "grab";
+      } else { tip.style.opacity = 0; cv.style.cursor = "grab"; }
+    }
+  });
+  window.addEventListener("mouseup", () => {
+    if (drag && !drag.moved) { /* Klick: unten behandelt */ }
+    if (drag) cv.style.cursor = "grab";
+    drag = null;
+  });
+  cv.addEventListener("click", (e) => {
+    const r = cv.getBoundingClientRect();
+    const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    for (const m of W3.hitMarkers)
+      if ((m.x - sx) ** 2 + (m.y - sy) ** 2 <= m.r * m.r) { selectCity(m.c.key); return; }
+    const geo = wunproj(sx, sy);
+    const f = geo && W3.world && featureAt(geo.lat, geo.lon);
+    if (f && W3.countryByIso?.get(f.iso)) selectCountry(W3.countryByIso.get(f.iso).country);
+  });
+  cv.addEventListener("dblclick", (e) => {
+    const r = cv.getBoundingClientRect();
+    const g = wunproj(e.clientX - r.left, e.clientY - r.top);
+    if (g) flyTo(g.lat, g.lon, Math.min(6, W3.zoom * 1.9));
+  });
+  cv.addEventListener("mouseleave", () => { $("worldtip").style.opacity = 0; drag = null; });
+  cv.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    W3.zoom = clamp(W3.zoom * (e.deltaY < 0 ? 1.15 : .87), .6, 8);
+    W3.lastUser = performance.now(); W3.anim = null; W3.dirty = true;
+  }, { passive: false });
+}
+
+/* Punkt-in-Polygon über alle Länder (Ray-Casting auf den Rohkoordinaten). */
+function featureAt(lat, lon) {
+  for (const f of W3.world) {
+    for (const a of f.rings) {
+      let inside = false;
+      for (let i = 0, j = a.length - 6; i < a.length; j = i, i += 6) {
+        const xi = a[i], yi = a[i + 1], xj = a[j], yj = a[j + 1];
+        if ((yi > lat) !== (yj > lat) &&
+            lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) inside = !inside;
+      }
+      if (inside) return f;
+    }
+  }
+  return null;
+}
+
+/* ===================== OPS · AGENTS & DURCHSATZ ===================== */
+/* Pollt /api/ops. Der Durchsatz wird NICHT vom Server geliefert, sondern hier
+ * aus den Differenzen zweier Messungen geschaetzt und exponentiell geglaettet —
+ * so bleibt die Restzeit-Schaetzung ruhig, statt bei jedem Poll zu springen. */
+const OPS = { last: null, rates: {}, timer: null, fails: 0 };
+const EMA = 0.25;
+
+function humanDur(sec) {
+  if (!isFinite(sec) || sec <= 0) return "—";
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600);
+  const m = Math.floor(sec % 3600 / 60), s = Math.floor(sec % 60);
+  if (d) return `${d} T ${h} h`;
+  if (h) return `${h} h ${m} min`;
+  if (m) return `${m} min ${s} s`;
+  return `${s} s`;
+}
+const humanAge = (sec) => humanDur(sec) === "—" ? "0 s" : humanDur(sec);
+
+function opsRate(key, value, ts) {
+  // Elemente pro Sekunde, exponentiell geglaettet.
+  const prev = OPS.last;
+  if (!prev || !(key in prev.vals)) return OPS.rates[key] ?? 0;
+  const dt = ts - prev.ts, dv = value - prev.vals[key];
+  if (dt <= 0) return OPS.rates[key] ?? 0;
+  const inst = Math.max(0, dv / dt);
+  const old = OPS.rates[key];
+  OPS.rates[key] = old == null ? inst : old + EMA * (inst - old);
+  return OPS.rates[key];
+}
+
+function workRow(label, done, total, rate, unit) {
+  const pct = total ? Math.min(100, done / total * 100) : 0;
+  const left = Math.max(0, total - done);
+  const eta = rate > 0 ? humanDur(left / rate) : (left ? "steht still" : "fertig");
+  const perMin = rate * 60;
+  return `<div class="work">
+    <div class="work-t"><span>${label}</span><b>${fmt(done)} / ${fmt(total)}</b></div>
+    <div class="work-bar"><i class="${pct >= 100 ? "am" : ""}" style="width:${pct}%"></i></div>
+    <div class="work-sub">
+      <span>${pct.toFixed(pct < 10 ? 2 : 1)} % · ${fmt(left)} offen</span>
+      <span>${perMin >= 1 ? Math.round(perMin) + " " + unit + "/min" : perMin > 0
+        ? perMin.toFixed(1) + " " + unit + "/min" : "—"} · ETA <em>${eta}</em></span>
+    </div></div>`;
+}
+
+const AGENT_DESC = { run: "Enumeration + Detail-Crawl", enrich: "Owner-Profile + Geocoding",
+  serve: "Dashboard-Server", detail: "Detail-Crawl", discover: "Enumeration",
+  monitor: "Konsolen-Monitor", analyze: "Report" };
+
+async function agentAction(action, payload) {
+  const msg = $("ops-msg");
+  try {
+    const r = await fetch("/api/agent", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...payload }) }).then((x) => x.json());
+    msg.className = "ops-msg " + (r.ok ? "ok" : "bad");
+    msg.textContent = r.ok
+      ? `${action === "start" ? "gestartet" : "gestoppt"}: ${r.cmd} (pid ${r.pid})`
+      : "Fehler: " + r.err;
+    // Nach dem Start direkt aufs Log des Kommandos schalten — sonst sieht man
+    // bei Ein-Schuss-Befehlen wie `status` nie ein Ergebnis.
+    if (r.ok && r.cmd && $("ops-logsel")) {
+      $("ops-logsel").value = r.cmd;
+      setTimeout(() => pollLog(true), 900);
+    }
+  } catch (e) {
+    msg.className = "ops-msg bad"; msg.textContent = "Fehler: " + e.message;
+  }
+  setTimeout(pollOps, 700);
+}
+
+function paintOps(d) {
+  const ts = d.ts;
+  // Agents
+  const ag = d.agents || [];
+  const crawlers = ag.filter((a) => a.cmd !== "serve");
+  $("ops-agentcount").textContent = crawlers.length ? `${crawlers.length} Crawler aktiv` : "kein Crawler";
+  $("ops-agents").innerHTML = ag.length ? ag.map((a) => `
+    <div class="agent${a.cmd === "serve" ? " idle" : ""}">
+      <i class="led"></i>
+      <span class="an">${a.cmd}<s>${AGENT_DESC[a.cmd] || ""} · pid ${a.pid}</s></span>
+      <span class="au">${humanAge(a.uptime)}
+        ${a.cmd !== "serve" ? `<button class="kill" data-stop="${a.pid}">STOP</button>` : ""}</span>
+    </div>`).join("")
+    : `<div class="ops-none">Kein Agent läuft.</div>`;
+  // Startknöpfe aus dem Server-Katalog (alle steuerbaren Kommandos).
+  const running = new Set(ag.map((a) => a.cmd));
+  const cat = d.startable || [];
+  $("ops-controls").innerHTML = cat.map((s) =>
+    `<button data-start="${s.cmd}" ${running.has(s.cmd) ? "disabled" : ""}
+       title="${s.desc}${s.dauer ? " · Dauerbetrieb" : " · läuft einmal durch"}">
+       ${s.dauer ? "▶" : "⏵"} ${s.cmd.toUpperCase()}</button>`).join("") +
+    `<div class="ops-msg" id="ops-msg"></div>`;
+  if (!OPS.logCmds) {   // Log-Auswahl einmal befüllen
+    OPS.logCmds = cat.map((s) => s.cmd);
+    $("ops-logsel").innerHTML = OPS.logCmds
+      .map((c) => `<option value="${c}">${c}</option>`).join("");
+    $("ops-logsel").onchange = () => pollLog(true);
+    pollLog(true);
+  }
+  $("ops-controls").querySelectorAll("[data-start]").forEach((b) =>
+    b.onclick = () => agentAction("start", { cmd: b.dataset.start }));
+  $("ops-agents").querySelectorAll("[data-stop]").forEach((b) =>
+    b.onclick = () => agentAction("stop", { pid: +b.dataset.stop }));
+  $("ops-stamp").textContent = "Stand " + new Date(ts * 1000).toLocaleTimeString("de-DE");
+
+  // Arbeit + ETA
+  const r = d.repos, o = d.owners, en = d.enum;
+  const rDet = opsRate("detailed", r.detailed, ts);
+  const rEnr = opsRate("enriched", o.enriched, ts);
+  const rChunk = opsRate("chunks", en.done, ts);
+  const rCache = opsRate("cache", d.http_cache, ts);
+  // Stillstand ehrlich benennen: laufender Agent + 0 Requests hat genau zwei
+  // Gruende — Budget leer (dann wartet er zu Recht) oder er haengt.
+  const bx = d.budget || {};
+  const stalled = crawlers.length && rCache === 0 && OPS.last;
+  const why = bx.exhausted
+    ? `<div class="ops-warn warn"><b>Wartet auf Rate-Limit-Reset.</b>
+        Kein Fortschritt möglich, bis das Budget zurückgesetzt ist.</div>`
+    : stalled
+      ? `<div class="ops-warn"><b>Läuft, aber ohne Durchsatz.</b>
+          Budget ist da, es kommen trotzdem keine Requests durch — Log prüfen
+          (<span class="dim">data/crawler.log</span>), notfalls STOP und neu starten.</div>`
+      : "";
+  $("ops-work").innerHTML = why +
+    workRow("Detail-Crawl <span class=dim>(Repos angereichert)</span>", r.detailed, r.total, rDet, "Repos") +
+    workRow("Enumeration <span class=dim>(ID-Chunks)</span>", en.done, en.total, rChunk, "Chunks") +
+    workRow("Owner-Anreicherung <span class=dim>(Profile+Geo)</span>", o.enriched, o.core, rEnr, "Owner") +
+    `<div class="work-sub" style="margin-top:10px">
+       <span>in Arbeit: <em>${fmt(r.inprogress)}</em> Repos · verortet: <em>${fmt(o.located)}</em></span>
+       <span>${Math.round(rCache * 60)} Requests/min</span></div>`;
+
+  // Token-Budget — gemessen an einem echten Request, nicht an /rate_limit.
+  const b = d.budget || {}, acc = d.accounts || {};
+  const pct = b.limit ? b.remaining / b.limit * 100 : 0;
+  const resetIn = b.reset ? Math.max(0, b.reset - ts) : 0;
+  $("ops-tokhead").textContent = acc.tokens
+    ? `${acc.tokens} Token · ${acc.accounts} Account${acc.accounts === 1 ? "" : "s"}` : "";
+  const warn = [];
+  if (b.exhausted) warn.push(`<div class="ops-warn"><b>Budget aufgebraucht.</b>
+    GitHub lehnt jeden Request mit 403 ab. Die Crawler warten bis zum Reset
+    in <b>${humanDur(resetIn)}</b> — das ist kein Fehler, sondern das Limit.</div>`);
+  if (acc.shared) warn.push(`<div class="ops-warn warn"><b>${acc.tokens} Tokens, 1 Account.</b>
+    GitHub rechnet das Limit pro <em>Account</em> ab, nicht pro Token — die Tokens teilen
+    sich also <b>${fmt(b.limit || 5000)}/h</b> statt sie zu addieren. Mehr Durchsatz gibt es
+    nur mit Tokens aus verschiedenen Accounts.</div>`);
+  if (b.err) warn.push(`<div class="ops-warn"><b>Budget nicht messbar:</b> ${b.err}</div>`);
+  $("ops-budget").innerHTML = warn.join("") + `
+    <div class="budget-big"><b class="${b.exhausted ? "dead" : ""}">${fmt(b.remaining || 0)}</b>
+      <span>von ${fmt(b.limit || 0)} Requests frei</span></div>
+    <div class="work-bar"><i class="${b.exhausted ? "am" : ""}" style="width:${pct}%"></i></div>
+    <div class="work-sub"><span>${pct.toFixed(0)} % Budget · ${fmt(b.used || 0)} verbraucht</span>
+      <span>Reset in <em>${humanDur(resetIn)}</em></span></div>`;
+  $("ops-tokens").innerHTML = "";
+
+  OPS.last = { ts, vals: { detailed: r.detailed, enriched: o.enriched,
+    chunks: en.done, cache: d.http_cache } };
+}
+
+async function pollOps() {
+  try {
+    const d = await fetch("/api/ops").then((r) => r.json());
+    OPS.fails = 0;
+    paintOps(d);
+  } catch (e) {
+    if (++OPS.fails === 1) $("ops-agents").innerHTML =
+      `<div class="ops-none">Ops-Endpunkt nicht erreichbar (Server neu starten für /api/ops).</div>`;
+  }
+}
+
+/* Agent-Log nachladen. Ein-Schuss-Kommandos (analyze/status/selfcheck) zeigen
+ * ihr Ergebnis sonst nirgends — hier steht ihre Ausgabe. */
+async function pollLog(force) {
+  const sel = $("ops-logsel"); if (!sel || !sel.value) return;
+  if (!force && !$("ops-logfollow").checked) return;
+  try {
+    const d = await fetch(`/api/agent/log?cmd=${encodeURIComponent(sel.value)}&lines=150`)
+      .then((r) => r.json());
+    const box = $("ops-logtext");
+    const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+    box.textContent = d.ok ? (d.text || "(leer)") : "Fehler: " + d.err;
+    if (atEnd || force) box.scrollTop = box.scrollHeight;   // mitlaufen, aber Scrollen respektieren
+    $("ops-logstate").textContent = d.running ? "läuft" : "nicht aktiv";
+  } catch (e) { /* Log ist Beiwerk — Fehler nicht ins UI schreien */ }
+}
+
+function startOps() {
+  pollOps();
+  // 4 s: der Server cached ohnehin ~4 s, schneller pollen bringt nur Last.
+  OPS.timer = setInterval(() => { pollOps(); pollLog(false); }, 4000);
+}
+
 /* ===================== START ===================== */
 /* Layout einmal vorrechnen, solange der Boot-Screen noch steht: sonst sieht der
  * Nutzer die Spirale sekundenlang auseinanderfallen. Zeitbudget statt fester
@@ -1203,12 +2471,16 @@ function prewarm(budgetMs = 900) {
 
 function start() {
   buildUI();
+  buildPatterns();
+  buildWorld();
+  wireSectionNav();
+  startOps();
   resize();
   wireCanvas();
   rebuild();
   prewarm();
   fit();
-  window.addEventListener("resize", () => { resize(); paint(); paintDash(); });
+  window.addEventListener("resize", () => { resize(); paint(); paintDash(); worldResize(); paintWorld(); });
   loop();
 }
 

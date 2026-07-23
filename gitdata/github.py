@@ -13,6 +13,7 @@ Features, die fuer "Massenverarbeitung" zaehlen:
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import ssl
@@ -43,6 +44,23 @@ def _ssl_context() -> ssl.SSLContext:
 
 
 _SSL = _ssl_context()
+
+
+# Verbindungsebene, nicht HTTP: Gegenstelle macht zu, Antwort bricht ab, TLS
+# haengt. Kommt beim Dauer-Crawl staendig vor (Enumerations-Antworten sind ~400 KB).
+# HTTPError ist eine URLError-Unterklasse, wird aber ZUERST abgefangen und
+# gehoert nicht hierher.
+TRANSIENT = (
+    urllib.error.URLError,          # DNS/Verbindung/TLS
+    http.client.IncompleteRead,
+    http.client.RemoteDisconnected,
+    http.client.BadStatusLine,
+    ConnectionError,                # inkl. ConnectionResetError
+    TimeoutError,
+    ssl.SSLError,
+    OSError,
+)
+NET_ATTEMPTS = 3
 
 
 class RateLimitExhausted(Exception):
@@ -170,48 +188,69 @@ class GitHubClient:
         """
         slot = self._pick_slot()  # RateLimitExhausted, wenn alle Tokens leer
         cached = self._cache_get(url)
-        req = urllib.request.Request(url, headers=self._headers(cached, slot))
-        self.requests_made += 1  # jeder echte HTTP-Call zaehlt (auch 304/404)
-        try:
-            with urllib.request.urlopen(req, timeout=30, context=_SSL) as resp:
+        # Verbindungsfehler kurz zurueckversuchen statt den Aufrufer abzuwerfen.
+        # Ohne das reisst jeder abgebrochene Download den ganzen Enumerations-Walk
+        # ab, der Worker geht 30 s in Backoff — und der Crawl steht praktisch still.
+        for attempt in range(NET_ATTEMPTS):
+            req = urllib.request.Request(url, headers=self._headers(cached, slot))
+            self.requests_made += 1  # jeder echte HTTP-Call zaehlt (auch 304/404)
+            resp = None
+            try:
+                resp = urllib.request.urlopen(req, timeout=30, context=_SSL)
                 self._track(slot, resp.headers)
                 self._last_link = resp.headers.get("Link")
                 body = resp.read().decode("utf-8")
                 self._cache_put(url, resp.headers.get("ETag"),
                                 resp.headers.get("Last-Modified"), resp.status, body)
                 return json.loads(body) if body else None
-        except urllib.error.HTTPError as e:
-            self._track(slot, e.headers)
-            self._last_link = e.headers.get("Link")
-            if e.code == 304 and cached:
-                return json.loads(cached["body"]) if cached["body"] else None
-            # 404 geloescht/privat, 409 leeres Repo, 451 rechtlich gesperrt -> keine Daten.
-            if e.code in (404, 409, 451):
-                return None
-            if e.code in (403, 429):
-                if e.headers.get("X-RateLimit-Remaining") == "0":
-                    slot.remaining = 0  # dieser Token ist leer
-                    # Anderer Token noch mit Budget? Dann sofort mit dem weiter.
-                    if _retry and any(s.remaining is None or s.remaining > 0
-                                      for s in self.slots):
-                        return self.get(url, _retry=False)
-                    raise RateLimitExhausted(slot.reset or int(time.time()) + 60)
-                # 403/429 ohne Primary-Limit: transientes Secondary-Limit von einem
-                # dauerhaft verbotenen Repo unterscheiden (sonst 5x sinnlos retryen).
-                retry_after = e.headers.get("Retry-After")
-                body = ""
-                try:
-                    body = e.read().decode("utf-8", "replace")
-                except Exception:
-                    pass
-                secondary = bool(retry_after) or "secondary rate limit" in body.lower()
-                if secondary:
-                    if _retry:
-                        time.sleep(min(int(retry_after) if retry_after else 60, 120))
-                        return self.get(url, _retry=False)
+            except urllib.error.HTTPError as e:
+                return self._on_http_error(e, url, slot, cached, _retry)
+            except TRANSIENT as e:
+                if attempt == NET_ATTEMPTS - 1:
                     raise
-                return None  # dauerhaft verboten -> wie 404 behandeln (keine Daten)
-            raise
+                time.sleep(1.5 * (attempt + 1))
+            finally:
+                # Sonst bleiben abgebrochene Verbindungen als CLOSE_WAIT haengen,
+                # bis dem Prozess die Dateideskriptoren ausgehen.
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+
+    def _on_http_error(self, e, url, slot, cached, _retry):
+        """HTTP-Statusfehler auswerten (304/404/403/429). Rueckgabe wie get()."""
+        self._track(slot, e.headers)
+        self._last_link = e.headers.get("Link")
+        if e.code == 304 and cached:
+            return json.loads(cached["body"]) if cached["body"] else None
+        # 404 geloescht/privat, 409 leeres Repo, 451 rechtlich gesperrt -> keine Daten.
+        if e.code in (404, 409, 451):
+            return None
+        if e.code in (403, 429):
+            if e.headers.get("X-RateLimit-Remaining") == "0":
+                slot.remaining = 0  # dieser Token ist leer
+                # Anderer Token noch mit Budget? Dann sofort mit dem weiter.
+                if _retry and any(s.remaining is None or s.remaining > 0
+                                  for s in self.slots):
+                    return self.get(url, _retry=False)
+                raise RateLimitExhausted(slot.reset or int(time.time()) + 60)
+            # 403/429 ohne Primary-Limit: transientes Secondary-Limit von einem
+            # dauerhaft verbotenen Repo unterscheiden (sonst 5x sinnlos retryen).
+            retry_after = e.headers.get("Retry-After")
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+            secondary = bool(retry_after) or "secondary rate limit" in body.lower()
+            if secondary:
+                if _retry:
+                    time.sleep(min(int(retry_after) if retry_after else 60, 120))
+                    return self.get(url, _retry=False)
+                raise            # Secondary-Limit auch beim zweiten Versuch -> hoch
+            return None  # dauerhaft verboten -> wie 404 behandeln (keine Daten)
+        raise
 
     def get_json(self, path: str, params: dict | None = None):
         url = f"{API}{path}"
